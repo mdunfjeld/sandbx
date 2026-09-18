@@ -1,0 +1,5 @@
+ARG BASE=sandbx-base
+FROM ${BASE}
+
+# Installs to ~/.local/bin/claude, already on PATH from the base image.
+RUN curl -fsSL https://claude.ai/install.sh | bash

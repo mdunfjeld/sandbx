@@ -1,0 +1,60 @@
+# Shared toolchain for every agent sandbox. Per-agent images are thin layers on
+# top of this one (see Containerfile.claude and friends), so bumping a single
+# agent does not rebuild any of this.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---- Base packages ----
+RUN apt-get update && apt-get install -y \
+    sudo \
+    curl \
+    git \
+    pipx \
+    ca-certificates \
+    python3-virtualenv \
+    wireshark \
+    python3-pip \
+    unzip \
+    less \
+    vim \
+    tshark \
+    nmap \
+    binwalk \
+    gnupg \
+    build-essential \
+    adb \
+    apktool \
+    golang \
+    zipalign \
+    apksigner \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Node 22 ----
+# The Codex and Copilot CLIs require Node >= 22; noble ships 18.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Container user ----
+# noble already ships an `ubuntu` user at uid 1000. Reclaim that uid for `agent`
+# so `--userns=keep-id:uid=1000` lands the host user squarely on this account.
+# The name must NOT be the host username: the launcher mirrors the project's
+# host path into the container, which would collide with /home/<hostuser>.
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && groupadd -g 1000 agent \
+    && useradd -m -u 1000 -g 1000 -s /bin/bash agent \
+    && echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent \
+    && chmod 0440 /etc/sudoers.d/agent
+
+USER agent
+ENV PATH=/home/agent/.local/bin:$PATH
+
+RUN pipx install frida-tools
+RUN pipx install impacket
+
+COPY --chown=agent:agent bashrc /home/agent/.bashrc
+
+# No ENTRYPOINT on purpose: the launcher passes -w and the agent command
+# explicitly, which replaces the old "find the first non-.claude directory" hack.
+CMD ["/bin/bash", "-l"]
