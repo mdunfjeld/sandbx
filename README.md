@@ -18,7 +18,9 @@ sandbx <agent> [path]              # path defaults to cwd
 sandbx <agent> [path] -- ARGS...   # pass ARGS to the agent
 sandbx <agent> --dry-run           # print the podman command, run nothing
 sandbx <agent> --no-relabel        # skip SELinux :z relabeling
-sandbx build [agent] [--no-base]   # default: all images
+sandbx build [agent]               # all agents; base only if missing
+sandbx build --base                # rebuild the base image too
+sandbx build --no-cache            # reinstall the agent CLIs (see Updating)
 sandbx list
 sandbx reset <agent> [-y]          # delete that agent's state and credentials
 ```
@@ -63,6 +65,30 @@ survives moving the project.
 - **Container user:** `agent`, uid 1000, via `--userns=keep-id:uid=1000,gid=1000`,
   so files come out owned by you. Passwordless `sudo`; installs vanish on exit.
 
+
+## Updating an agent
+
+The CLIs live in the image, not in a mount, so an in-container `npm update -g`
+or self-update is discarded on exit. Rebuilding alone isn't enough either: each
+install is one `RUN` layer, so podman reuses the cached one and the version
+never moves. `--no-cache` is what forces the reinstall:
+
+```sh
+sandbx build claude --no-cache                 # one agent
+sandbx build --no-cache                        # all agents
+podman run --rm sandbx-claude claude --version # confirm
+```
+
+The base image is left alone unless it's missing, since it changes rarely and
+takes minutes. Rebuild it deliberately:
+
+```sh
+sandbx build --base --no-cache --pull          # base (+ ubuntu:24.04) and agents
+```
+
+`--pull` only affects the base; agent images build `FROM sandbx-base`. `--no-base`
+skips the base even when it's missing. Old layers stay on disk — `podman image
+prune` reclaims the space.
 
 ## Install / uninstall
 

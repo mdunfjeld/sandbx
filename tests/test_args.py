@@ -563,6 +563,85 @@ class TestAgentEnv(unittest.TestCase):
                 self.assertIn(f"{var}={env[var]}", argv("opencode"))
 
 
+class TestBuildFlags(unittest.TestCase):
+    """The flags that decide whether a rebuild actually reinstalls anything."""
+
+    CF = Path("/repo/images/Containerfile.claude")
+
+    def cmd(self, **kw):
+        return sandbx.build_image_cmd("sandbx-claude", self.CF, **kw)
+
+    def test_plain_build_uses_the_cache(self):
+        self.assertNotIn("--no-cache", self.cmd())
+        self.assertNotIn("--pull", self.cmd())
+
+    def test_flags_are_passed_through(self):
+        self.assertIn("--no-cache", self.cmd(no_cache=True))
+        self.assertIn("--pull", self.cmd(pull=True))
+
+    def test_flags_precede_the_build_arguments(self):
+        """podman build takes options before the context path."""
+        cmd = self.cmd(no_cache=True, pull=True)
+        self.assertEqual(cmd[:4], ["podman", "build", "--no-cache", "--pull"])
+        self.assertEqual(cmd[-1], str(sandbx.IMAGES_DIR))
+        self.assertEqual(cmd[cmd.index("-f") + 1], str(self.CF))
+        self.assertEqual(cmd[cmd.index("-t") + 1], "sandbx-claude")
+
+    def builds(self, args, base_exists=True):
+        """Run cmd_build with podman stubbed; return the recorded build calls."""
+        calls = []
+        def record(tag, containerfile, *, no_cache=False, pull=False):
+            calls.append((tag, no_cache, pull))
+        with unittest.mock.patch.object(sandbx, "_build_image", record), \
+             unittest.mock.patch.object(sandbx, "image_exists", lambda tag: base_exists):
+            sandbx.cmd_build(args)
+        return calls
+
+    def tags(self, args, **kw):
+        return [tag for tag, _, _ in self.builds(args, **kw)]
+
+    def test_default_skips_the_base(self):
+        """The base changes rarely; rebuilding it on every update wastes minutes."""
+        self.assertNotIn(sandbx.BASE_IMAGE, self.tags([]))
+        self.assertEqual(sorted(self.tags([])),
+                         sorted(a.image for a in AGENTS.values()))
+
+    def test_base_is_built_when_missing(self):
+        """First build: agent images are FROM sandbx-base, so it must exist."""
+        self.assertEqual(self.tags([], base_exists=False)[0], sandbx.BASE_IMAGE)
+
+    def test_no_base_wins_even_when_missing(self):
+        self.assertNotIn(sandbx.BASE_IMAGE, self.tags(["--no-base"], base_exists=False))
+
+    def test_base_flag_forces_a_rebuild(self):
+        self.assertEqual(self.tags(["--base"])[0], sandbx.BASE_IMAGE)
+
+    def test_base_and_no_base_conflict(self):
+        with self.assertRaises(SystemExit):
+            self.builds(["--base", "--no-base"])
+
+    def test_no_cache_reaches_every_image_built(self):
+        calls = self.builds(["--base", "--no-cache"])
+        self.assertTrue(all(no_cache for _, no_cache, _ in calls), calls)
+        self.assertEqual(len(calls), len(AGENTS) + 1)   # base + every agent
+
+    def test_pull_applies_to_the_base_only(self):
+        """Agent images are FROM sandbx-base, so --pull is meaningless there."""
+        calls = self.builds(["--base", "--pull"])
+        pulled = [tag for tag, _, pull in calls if pull]
+        self.assertEqual(pulled, [sandbx.BASE_IMAGE])
+
+    def test_plain_build_passes_neither(self):
+        for tag, no_cache, pull in self.builds([]):
+            with self.subTest(image=tag):
+                self.assertFalse(no_cache)
+                self.assertFalse(pull)
+
+    def test_flags_compose_with_agent_and_no_base(self):
+        calls = self.builds(["claude", "--no-cache", "--no-base"])
+        self.assertEqual(calls, [(AGENTS["claude"].image, True, False)])
+
+
 class TestRegistry(unittest.TestCase):
     def test_state_dirs_are_unique(self):
         dirs = [a.state_dir for a in AGENTS.values()]

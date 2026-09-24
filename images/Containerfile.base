@@ -1,7 +1,7 @@
 # Shared toolchain for every agent sandbox. Per-agent images are thin layers on
 # top of this one (see Containerfile.claude and friends), so bumping a single
 # agent does not rebuild any of this.
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 

@@ -375,29 +375,68 @@ def cmd_build(argv: Sequence[str]) -> int:
     parser.add_argument("agent", nargs="?", choices=sorted(AGENTS),
                         help="agent image to build (default: --all)")
     parser.add_argument("--all", action="store_true", help="build every agent image")
-    parser.add_argument("--no-base", action="store_true",
-                        help="skip rebuilding the shared base image")
+    base = parser.add_mutually_exclusive_group()
+    base.add_argument("--base", action="store_true",
+                      help="also rebuild the shared base image (default: only if missing)")
+    base.add_argument("--no-base", action="store_true",
+                      help="never build the base image, even if it is missing")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="ignore cached layers; needed to pick up new agent versions")
+    parser.add_argument("--pull", action="store_true",
+                        help="re-fetch ubuntu:24.04 (applies to the base image only)")
     opts = parser.parse_args(list(argv))
 
     if not opts.agent and not opts.all:
         opts.all = True
     targets = sorted(AGENTS) if opts.all else [opts.agent]
 
-    if not opts.no_base:
-        _build_image(BASE_IMAGE, IMAGES_DIR / "Containerfile.base")
+    # The base changes rarely and takes minutes; agent images are the ones that
+    # need updating. So build it only when asked, or when it does not exist yet
+    # -- without it the agent builds fail on an unknown FROM.
+    if opts.base or (not opts.no_base and not image_exists(BASE_IMAGE)):
+        _build_image(BASE_IMAGE, IMAGES_DIR / "Containerfile.base",
+                     no_cache=opts.no_cache, pull=opts.pull)
     for name in targets:
-        _build_image(AGENTS[name].image, IMAGES_DIR / f"Containerfile.{name}")
+        # --pull only concerns the registry base (ubuntu:24.04), which the agent
+        # images do not reference; passing it here would be a no-op at best.
+        _build_image(AGENTS[name].image, IMAGES_DIR / f"Containerfile.{name}",
+                     no_cache=opts.no_cache)
     return 0
 
 
-def _build_image(tag: str, containerfile: Path) -> None:
+def build_image_cmd(tag: str, containerfile: Path, *,
+                    no_cache: bool = False, pull: bool = False) -> list[str]:
+    """The podman build argv. Pure, so the flags can be asserted in tests.
+
+    --no-cache is what makes a rebuild actually reinstall the agent: the
+    install step is a single RUN layer, so without it podman reuses the cached
+    layer and the image keeps whatever version it was first built with.
+    """
+    cmd = ["podman", "build"]
+    if no_cache:
+        cmd.append("--no-cache")
+    if pull:
+        cmd.append("--pull")
+    return cmd + ["-t", tag, "-f", str(containerfile), str(IMAGES_DIR)]
+
+
+def _build_image(tag: str, containerfile: Path, *,
+                 no_cache: bool = False, pull: bool = False) -> None:
     if not containerfile.exists():
         raise SandboxError(f"missing {containerfile}")
-    cmd = ["podman", "build", "-t", tag, "-f", str(containerfile), str(IMAGES_DIR)]
+    cmd = build_image_cmd(tag, containerfile, no_cache=no_cache, pull=pull)
     print(f"==> {shlex.join(cmd)}", file=sys.stderr)
     result = subprocess.run(cmd)
     if result.returncode != 0:
         raise SandboxError(f"build failed for {tag}")
+
+
+def image_exists(tag: str) -> bool:
+    """Whether podman already has this image locally."""
+    if shutil.which("podman") is None:
+        return False
+    probe = subprocess.run(["podman", "image", "exists", tag], capture_output=True)
+    return probe.returncode == 0
 
 
 def cmd_list(argv: Sequence[str]) -> int:
@@ -407,13 +446,7 @@ def cmd_list(argv: Sequence[str]) -> int:
     print(f"{'AGENT':<10} {'IMAGE':<22} {'BUILT':<7} STATE")
     for name in sorted(AGENTS):
         agent = AGENTS[name]
-        built = "?"
-        if have_podman:
-            probe = subprocess.run(
-                ["podman", "image", "exists", agent.image],
-                capture_output=True,
-            )
-            built = "yes" if probe.returncode == 0 else "no"
+        built = "yes" if image_exists(agent.image) else "no" if have_podman else "?"
         state = agents_root / agent.state_dir
         marker = str(state) if state.exists() else f"{state} (empty)"
         print(f"{name:<10} {agent.image:<22} {built:<7} {marker}")
