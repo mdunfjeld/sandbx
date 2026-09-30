@@ -29,6 +29,9 @@ BASE_IMAGE = "sandbx-base"
 # Where every agent's project lands inside the container. Rendered by
 # workdir_for(); see there for the placeholders and why both are needed.
 WORKDIR_TEMPLATE = "/workspace/{name}"
+# Run instead of the agent under --shell. Same as the base image's CMD, but
+# spelled out so the argv stays pure and testable.
+SHELL_COMMAND = ("/bin/bash", "-l")
 IMAGES_DIR = Path(__file__).resolve().parent / "images"
 
 
@@ -256,9 +259,14 @@ def build_podman_args(
     relabel: bool = True,
     interactive: bool = True,
     extra: Sequence[str] = (),
+    shell: bool = False,
 ) -> list[str]:
     """Construct the full podman argv. Pure, so tests can assert the isolation
-    invariants directly instead of eyeballing a command line."""
+    invariants directly instead of eyeballing a command line.
+
+    shell=True swaps only the trailing command for SHELL_COMMAND; the sandbox
+    itself is identical, so the agent can be started by hand inside it.
+    """
     try:
         agent = AGENTS[name]
     except KeyError:
@@ -267,6 +275,8 @@ def build_podman_args(
         ) from None
 
     validate_agent(name, agent)
+    if shell and extra:
+        raise SandboxError("--shell cannot be combined with -- ARGS")
 
     config_src = agents_root / agent.state_dir
     # ":z" (shared), not ":Z" (private). Containers here are ephemeral and get a
@@ -306,8 +316,11 @@ def build_podman_args(
     for key, value in agent.env.items():
         args += ["-e", f"{key}={value}"]
     args.append(agent.image)
-    args += list(agent.command)
-    args += list(extra)
+    if shell:
+        args += list(SHELL_COMMAND)
+    else:
+        args += list(agent.command)
+        args += list(extra)
     return args
 
 
@@ -343,7 +356,13 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
                         help="skip SELinux :z relabeling; disable label confinement instead")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the podman command without running it")
+    parser.add_argument("-s", "--shell", action="store_true",
+                        help=f"open a bash shell in the sandbox instead of starting "
+                             f"{name}; run `{shlex.join(AGENTS[name].command)}` "
+                             f"from it when ready")
     opts = parser.parse_args(ours)
+    if opts.shell and passthrough:
+        parser.error("--shell cannot be combined with -- ARGS")
 
     project = resolve_project(opts.path)
     agents_root = state_root()
@@ -355,6 +374,7 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
         relabel=not opts.no_relabel,
         interactive=sys.stdin.isatty(),
         extra=passthrough,
+        shell=opts.shell,
     )
 
     if opts.dry_run:
@@ -367,6 +387,9 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
     # Bind mounts get no copy-up, so podman would create this root-owned. Do it
     # after the podman check so a failed launch leaves no stray state behind.
     (agents_root / AGENTS[name].state_dir).mkdir(parents=True, exist_ok=True)
+    if opts.shell:
+        print(f"sandbx: {name} not started; run "
+              f"`{shlex.join(AGENTS[name].command)}` to launch it", file=sys.stderr)
     os.execvp("podman", args)  # replaces this process; keeps the TTY clean
 
 

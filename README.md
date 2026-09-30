@@ -16,6 +16,7 @@ The container is deleted on exit; the agent's config and session history persist
 ```
 sandbx <agent> [path]              # path defaults to cwd
 sandbx <agent> [path] -- ARGS...   # pass ARGS to the agent
+sandbx <agent> [path] -s|--shell   # bash in the sandbox; start the agent yourself
 sandbx <agent> --dry-run           # print the podman command, run nothing
 sandbx <agent> --no-relabel        # skip SELinux :z relabeling
 sandbx build [agent]               # all agents; base only if missing
@@ -64,6 +65,10 @@ survives moving the project.
   confinement instead.
 - **Container user:** `agent`, uid 1000, via `--userns=keep-id:uid=1000,gid=1000`,
   so files come out owned by you. Passwordless `sudo`; installs vanish on exit.
+- **Shell first:** `--shell` builds the identical sandbox (same mounts and env)
+  but runs `bash -l` instead of the agent. Set things up, then run `claude` (etc.)
+  by hand in the same container; it all goes away when the shell exits. Can't
+  be combined with `-- ARGS` — pass those on the agent's own command line.
 
 
 ## Updating an agent

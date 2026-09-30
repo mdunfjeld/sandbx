@@ -5,8 +5,10 @@ something to re-verify by eye every time the registry changes. Nothing here
 needs podman, so it runs anywhere.
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import shutil
 import sys
 import tempfile
@@ -93,8 +95,9 @@ class TestAgentIndependence(unittest.TestCase):
 
     def test_argv_shape_identical_under_every_option(self):
         for kw in [{}, {"relabel": False}, {"interactive": False},
-                   {"extra": ["--resume"]},
-                   {"relabel": False, "interactive": False}]:
+                   {"extra": ["--resume"]}, {"shell": True},
+                   {"relabel": False, "interactive": False},
+                   {"shell": True, "relabel": False, "interactive": False}]:
             shapes = {name: skeleton(name, **kw) for name in AGENTS}
             first = shapes[next(iter(shapes))]
             for name, shape in shapes.items():
@@ -299,6 +302,87 @@ class TestFlags(unittest.TestCase):
     def test_unknown_agent_rejected(self):
         with self.assertRaises(SandboxError):
             argv("gemini")
+
+
+class TestShellMode(unittest.TestCase):
+    """--shell must yield the very same sandbox; only the command differs."""
+
+    def run_cli(self, name, args, *, real=False):
+        """cmd_run against a temp project and state root; returns (rc, out, err).
+
+        real=True goes past --dry-run with podman and execvp faked out.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "proj"
+            project.mkdir()
+            env = {"HOME": str(Path(tmp) / "home"),
+                   "XDG_DATA_HOME": str(Path(tmp) / "data")}
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(unittest.mock.patch.dict(sandbx.os.environ, env))
+                stack.enter_context(contextlib.redirect_stdout(out))
+                stack.enter_context(contextlib.redirect_stderr(err))
+                execvp = None
+                if real:
+                    stack.enter_context(unittest.mock.patch.object(
+                        sandbx.shutil, "which", return_value="/usr/bin/podman"))
+                    execvp = stack.enter_context(
+                        unittest.mock.patch.object(sandbx.os, "execvp"))
+                rc = sandbx.cmd_run(name, [str(project), *args])
+            self.execvp = execvp
+            return rc, out.getvalue(), err.getvalue()
+
+    def test_runs_a_login_shell_instead_of_the_agent(self):
+        for name, agent in AGENTS.items():
+            with self.subTest(agent=name):
+                args = argv(name, shell=True)
+                tail = args[args.index(agent.image) + 1:]
+                self.assertEqual(tail, list(sandbx.SHELL_COMMAND))
+
+    def test_sandbox_is_identical_up_to_the_image(self):
+        for name, agent in AGENTS.items():
+            for kw in [{}, {"relabel": False}, {"interactive": False}]:
+                with self.subTest(agent=name, opts=kw):
+                    normal = argv(name, **kw)
+                    shell = argv(name, shell=True, **kw)
+                    cut = normal.index(agent.image) + 1
+                    self.assertEqual(shell[:cut], normal[:cut])
+
+    def test_still_exactly_two_mounts_and_agent_marker(self):
+        for name in AGENTS:
+            with self.subTest(agent=name):
+                args = argv(name, shell=True)
+                self.assertEqual(len(mounts(args)), 2)
+                self.assertIn(f"SANDBX_AGENT={name}", args)
+
+    def test_builder_rejects_passthrough(self):
+        with self.assertRaises(SandboxError):
+            argv(shell=True, extra=["--resume"])
+
+    def test_cli_rejects_passthrough(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("claude", ["--shell", "--dry-run", "--", "--resume"])
+
+    def test_dry_run_prints_the_shell_command_and_no_hint(self):
+        for flag in ("--shell", "-s"):
+            with self.subTest(flag=flag):
+                rc, out, err = self.run_cli("claude", [flag, "--dry-run"])
+                self.assertEqual(rc, 0)
+                self.assertTrue(out.strip().endswith("sandbx-claude /bin/bash -l"), out)
+                self.assertEqual(err, "")
+
+    def test_real_run_prints_a_hint_and_execs_the_shell(self):
+        for name, agent in AGENTS.items():
+            with self.subTest(agent=name):
+                _, _, err = self.run_cli(name, ["--shell"], real=True)
+                self.assertIn(f"run `{agent.command[0]}`", err)
+                args = self.execvp.call_args.args[1]
+                self.assertEqual(args[-2:], list(sandbx.SHELL_COMMAND))
+
+    def test_normal_run_prints_no_hint(self):
+        _, _, err = self.run_cli("claude", [], real=True)
+        self.assertEqual(err, "")
+        self.assertEqual(self.execvp.call_args.args[1][-1], "claude")
 
 
 class TestGuards(unittest.TestCase):
