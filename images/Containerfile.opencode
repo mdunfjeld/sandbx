@@ -1,6 +1,11 @@
 ARG BASE=sandbx-base
 FROM ${BASE}
 
-USER root
-RUN npm install -g opencode-ai
-USER agent
+# The v2 installer always targets ~/.opencode/bin, but ~/.opencode is opencode's
+# state mount at runtime and would shadow the binary. Move it to ~/.local/bin,
+# already on PATH from the base image. --no-modify-path: PATH comes from ENV,
+# and podman execs the command directly without reading .bashrc anyway.
+RUN curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path \
+    && mkdir -p ~/.local/bin \
+    && mv ~/.opencode/bin/opencode ~/.local/bin/opencode \
+    && rm -rf ~/.opencode
