@@ -98,6 +98,17 @@ AGENTS: dict[str, Agent] = {
         },
         command=("opencode",),
     ),
+    # vibe honours VIBE_HOME for config, sessions and logs, but a few paths
+    # (ACP logs among them) hardcode ~/.vibe. Mounting at exactly that path
+    # makes the two agree. There is no Secret Service in the container, so the
+    # API key falls back from the keyring to $VIBE_HOME/.env and persists too.
+    "vibe": Agent(
+        image="sandbx-vibe",
+        state_dir="vibe",
+        config_path=f"{CONTAINER_HOME}/.vibe",
+        env={"VIBE_HOME": f"{CONTAINER_HOME}/.vibe"},
+        command=("vibe",),
+    ),
 }
 
 

@@ -1,0 +1,9 @@
+ARG BASE=sandbx-base
+FROM ${BASE}
+
+# The installer bootstraps uv, then runs `uv tool install mistral-vibe`. Both uv
+# and vibe land in ~/.local/bin, already on PATH from the base image; the tool's
+# venv lives under ~/.local/share/uv, clear of the ~/.vibe state mount. Drop
+# uv's download cache so it does not ride along in the image.
+RUN curl -LsSf https://mistral.ai/vibe/install.sh | bash \
+    && uv cache clean

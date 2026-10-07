@@ -26,7 +26,7 @@ sandbx list
 sandbx reset <agent> [-y]          # delete that agent's state and credentials
 ```
 
-Agents: `claude`, `codex`, `copilot`, `opencode`.
+Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe` (Mistral Vibe).
 
 ## Guarantees
 
@@ -47,7 +47,8 @@ against a kernel exploit.
 ├── claude/    -> /home/agent/.claude    (CLAUDE_CONFIG_DIR)
 ├── codex/     -> /home/agent/.codex     (CODEX_HOME)
 ├── copilot/   -> /home/agent/.copilot   (COPILOT_HOME)
-└── opencode/  -> /home/agent/.opencode  (XDG_{CONFIG,DATA,STATE,CACHE}_HOME)
+├── opencode/  -> /home/agent/.opencode  (XDG_{CONFIG,DATA,STATE,CACHE}_HOME)
+└── vibe/      -> /home/agent/.vibe      (VIBE_HOME)
 ```
 
 ## Project path inside the container

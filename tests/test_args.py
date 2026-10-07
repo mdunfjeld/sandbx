@@ -269,6 +269,7 @@ class TestFlags(unittest.TestCase):
             "--dangerously-skip-permissions",          # claude
             "--dangerously-bypass-approvals-and-sandbox",  # codex
             "--allow-all-tools",                       # copilot
+            "--auto-approve", "--yolo",                # vibe
         ]
         for name in AGENTS:
             rendered = " ".join(argv(name))
@@ -645,6 +646,14 @@ class TestAgentEnv(unittest.TestCase):
             with self.subTest(var=var):
                 self.assertIn(var, env)
                 self.assertIn(f"{var}={env[var]}", argv("opencode"))
+
+    def test_vibe_home_is_the_hardcoded_default(self):
+        """Some vibe paths ignore VIBE_HOME and write to ~/.vibe regardless; they
+        persist only if the mount and VIBE_HOME are both exactly that path."""
+        agent = AGENTS["vibe"]
+        self.assertEqual(agent.config_path, f"{sandbx.CONTAINER_HOME}/.vibe")
+        self.assertEqual(agent.env["VIBE_HOME"], agent.config_path)
+        self.assertIn(f"VIBE_HOME={agent.config_path}", argv("vibe"))
 
 
 class TestBuildFlags(unittest.TestCase):
