@@ -39,6 +39,8 @@ die() { echo "install: $*" >&2; exit 1; }
 [ -x "$SRC" ] || chmod +x "$SRC"
 command -v python3 >/dev/null || die "python3 not found; sandbx needs it"
 command -v podman >/dev/null || echo "install: warning: podman not found on PATH" >&2
+command -v krun >/dev/null || echo "install: warning: krun not found on PATH;" \
+    "sandboxes are libkrun microVMs (Fedora: sudo dnf install crun-krun)" >&2
 
 TARGET="$PREFIX/sandbx"
 mkdir -p "$PREFIX"
