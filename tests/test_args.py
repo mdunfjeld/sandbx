@@ -9,7 +9,9 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import shlex
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -32,6 +34,14 @@ build = sandbx.build_podman_args
 HOME = Path("/home/tester")
 AGENTS_ROOT = HOME / ".local/share/sandbx/agents"
 PROJECT = Path("/home/tester/work/myproject")
+
+# Every combination of builder options the shape and network tests sweep.
+OPTION_SETS = [
+    {}, {"relabel": False}, {"interactive": False},
+    {"extra": ["--resume"]}, {"shell": True}, {"host_block": 30090},
+    {"relabel": False, "interactive": False},
+    {"shell": True, "relabel": False, "interactive": False},
+]
 
 
 def argv(name="claude", project=PROJECT, **kw):
@@ -94,10 +104,7 @@ class TestAgentIndependence(unittest.TestCase):
                 self.assertEqual(shape, first)
 
     def test_argv_shape_identical_under_every_option(self):
-        for kw in [{}, {"relabel": False}, {"interactive": False},
-                   {"extra": ["--resume"]}, {"shell": True},
-                   {"relabel": False, "interactive": False},
-                   {"shell": True, "relabel": False, "interactive": False}]:
+        for kw in OPTION_SETS:
             shapes = {name: skeleton(name, **kw) for name in AGENTS}
             first = shapes[next(iter(shapes))]
             for name, shape in shapes.items():
@@ -243,10 +250,60 @@ class TestProjectMount(unittest.TestCase):
 
 
 class TestFlags(unittest.TestCase):
-    def test_ephemeral_and_host_network(self):
+    def test_ephemeral_microvm(self):
         args = argv()
         self.assertIn("--rm", args)
-        self.assertIn("--network=host", args)
+        self.assertIn("--runtime=krun", args)
+
+    def test_pasta_forwards_only_the_reserved_ranges(self):
+        self.assertIn(
+            "--network=pasta:-T,30000-30009,-t,127.0.0.1/30010-30019:30010-30019",
+            argv(),
+        )
+        self.assertIn(
+            "--network=pasta:-T,30000-30009,-t,127.0.0.1/30040-30049:30010-30019",
+            argv(host_block=30040),
+        )
+
+    def test_never_host_network(self):
+        """The regression guard: no option or agent brings --network=host back."""
+        for kw in OPTION_SETS:
+            for name in AGENTS:
+                with self.subTest(agent=name, opts=kw):
+                    nets = [t for t in argv(name, **kw) if t.startswith("--net")]
+                    self.assertEqual(len(nets), 1, nets)
+                    self.assertTrue(nets[0].startswith("--network=pasta:"), nets)
+
+    def test_vm_runs_as_namespace_root(self):
+        """As `agent`, the VMM cannot open root-owned files for the guest, and
+        sudo fails with EACCES before it reads a line of its config."""
+        args = argv()
+        self.assertEqual(args[args.index("--user") + 1], "0:0")
+        self.assertIn(f"HOME={sandbx.CONTAINER_HOME}", args)
+
+    def test_workload_always_drops_to_agent(self):
+        """Root is for the VMM only; whatever runs in the guest runs as agent."""
+        self.assertIn(f"--reuid={sandbx.CONTAINER_UID}", sandbx.AS_AGENT)
+        self.assertIn(f"--regid={sandbx.CONTAINER_UID}", sandbx.AS_AGENT)
+        for kw in OPTION_SETS:
+            for name, agent in AGENTS.items():
+                with self.subTest(agent=name, opts=kw):
+                    args = argv(name, **kw)
+                    start = args.index(agent.image) + 1
+                    self.assertEqual(
+                        args[start:start + len(sandbx.AS_AGENT)],
+                        list(sandbx.AS_AGENT),
+                    )
+
+    def test_vm_memory_is_set(self):
+        """libkrun's 1 GiB default is too small; unset, builds run out of RAM."""
+        args = argv()
+        self.assertEqual(args[args.index("--annotation") + 1], "krun.ram_mib=4096")
+
+    def test_adb_and_host_port_env(self):
+        args = argv(host_block=30020)
+        self.assertIn("ANDROID_ADB_SERVER_PORT=30000", args)
+        self.assertIn("SANDBX_HOST_PORTS=30020-30029", args)
 
     def test_userns_pins_uid(self):
         self.assertIn("--userns=keep-id:uid=1000,gid=1000", argv())
@@ -305,13 +362,13 @@ class TestFlags(unittest.TestCase):
             argv("gemini")
 
 
-class TestShellMode(unittest.TestCase):
-    """--shell must yield the very same sandbox; only the command differs."""
-
-    def run_cli(self, name, args, *, real=False):
+class CliRunner:
+    def run_cli(self, name, args, *, real=False, kvm=True):
         """cmd_run against a temp project and state root; returns (rc, out, err).
 
-        real=True goes past --dry-run with podman and execvp faked out.
+        real=True goes past --dry-run with podman and execvp faked out. The
+        host-facing probes are faked either way: the port block is always the
+        first, and kvm decides whether /dev/kvm looks usable.
         """
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "proj"
@@ -323,22 +380,29 @@ class TestShellMode(unittest.TestCase):
                 stack.enter_context(unittest.mock.patch.dict(sandbx.os.environ, env))
                 stack.enter_context(contextlib.redirect_stdout(out))
                 stack.enter_context(contextlib.redirect_stderr(err))
-                execvp = None
+                stack.enter_context(unittest.mock.patch.object(
+                    sandbx, "pick_host_block", return_value=sandbx.HOST_BLOCKS[0]))
+                stack.enter_context(unittest.mock.patch.object(
+                    sandbx, "have_kvm", return_value=kvm))
+                self.execvp = None
                 if real:
                     stack.enter_context(unittest.mock.patch.object(
                         sandbx.shutil, "which", return_value="/usr/bin/podman"))
-                    execvp = stack.enter_context(
+                    self.execvp = stack.enter_context(
                         unittest.mock.patch.object(sandbx.os, "execvp"))
                 rc = sandbx.cmd_run(name, [str(project), *args])
-            self.execvp = execvp
             return rc, out.getvalue(), err.getvalue()
+
+
+class TestShellMode(CliRunner, unittest.TestCase):
+    """--shell must yield the very same sandbox; only the command differs."""
 
     def test_runs_a_login_shell_instead_of_the_agent(self):
         for name, agent in AGENTS.items():
             with self.subTest(agent=name):
                 args = argv(name, shell=True)
                 tail = args[args.index(agent.image) + 1:]
-                self.assertEqual(tail, list(sandbx.SHELL_COMMAND))
+                self.assertEqual(tail, [*sandbx.AS_AGENT, *sandbx.SHELL_COMMAND])
 
     def test_sandbox_is_identical_up_to_the_image(self):
         for name, agent in AGENTS.items():
@@ -369,7 +433,8 @@ class TestShellMode(unittest.TestCase):
             with self.subTest(flag=flag):
                 rc, out, err = self.run_cli("claude", [flag, "--dry-run"])
                 self.assertEqual(rc, 0)
-                self.assertTrue(out.strip().endswith("sandbx-claude /bin/bash -l"), out)
+                tail = shlex.join(["sandbx-claude", *sandbx.AS_AGENT, "/bin/bash", "-l"])
+                self.assertTrue(out.strip().endswith(tail), out)
                 self.assertEqual(err, "")
 
     def test_real_run_prints_a_hint_and_execs_the_shell(self):
@@ -380,10 +445,96 @@ class TestShellMode(unittest.TestCase):
                 args = self.execvp.call_args.args[1]
                 self.assertEqual(args[-2:], list(sandbx.SHELL_COMMAND))
 
-    def test_normal_run_prints_no_hint(self):
+    def test_normal_run_prints_only_the_port_line(self):
         _, _, err = self.run_cli("claude", [], real=True)
-        self.assertEqual(err, "")
+        self.assertEqual(
+            err, "sandbx: host 127.0.0.1:30010-30019 -> sandbox :30010-30019\n")
         self.assertEqual(self.execvp.call_args.args[1][-1], "claude")
+
+
+class TestKvmCheck(CliRunner, unittest.TestCase):
+    """Without /dev/kvm, krun fails deep inside podman; say why up front."""
+
+    def test_missing_kvm_is_a_clean_error_and_nothing_runs(self):
+        with self.assertRaises(SandboxError) as ctx:
+            self.run_cli("claude", [], real=True, kvm=False)
+        self.assertIn("/dev/kvm", str(ctx.exception))
+        self.execvp.assert_not_called()
+
+    def test_dry_run_works_without_kvm(self):
+        rc, out, _ = self.run_cli("claude", ["--dry-run"], kvm=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("--runtime=krun", out)
+
+
+class TestPorts(unittest.TestCase):
+    """The reserved ranges. An overlap would loop the forwards into each other;
+    a shared inbound block would stop a second sandbox from starting."""
+
+    def ports(self, span):
+        return set(range(span[0], span[1] + 1))
+
+    def network(self, **kw):
+        return next(t for t in argv(**kw) if t.startswith("--network="))
+
+    def test_blocks_are_disjoint_from_outbound_and_each_other(self):
+        seen = self.ports(sandbx.TO_HOST_PORTS)
+        for block in sandbx.HOST_BLOCKS:
+            with self.subTest(block=block):
+                ports = self.ports(sandbx.host_ports(block))
+                self.assertFalse(ports & seen)
+                seen |= ports
+
+    def test_inside_ranges_are_disjoint(self):
+        """-T listeners and the agent's inbound ports share the VM's namespace."""
+        self.assertFalse(
+            self.ports(sandbx.INBOUND_PORTS) & self.ports(sandbx.TO_HOST_PORTS))
+
+    def test_every_block_is_as_wide_as_the_inbound_range(self):
+        width = len(self.ports(sandbx.INBOUND_PORTS))
+        for block in sandbx.HOST_BLOCKS:
+            with self.subTest(block=block):
+                self.assertEqual(len(self.ports(sandbx.host_ports(block))), width)
+
+    def test_adb_port_is_forwarded_to_the_host(self):
+        self.assertIn(sandbx.ADB_SERVER_PORT, self.ports(sandbx.TO_HOST_PORTS))
+
+    def test_inbound_listens_on_host_loopback_only(self):
+        """Without the address, pasta would expose the agent's servers to the LAN."""
+        for block in sandbx.HOST_BLOCKS:
+            with self.subTest(block=block):
+                inbound = self.network(host_block=block).split(",-t,", 1)[1]
+                self.assertTrue(inbound.startswith("127.0.0.1/"), inbound)
+
+    def test_podman_comma_split_yields_the_intended_options(self):
+        """Podman splits pasta options on commas; a comma inside a spec would
+        silently turn one forward into several unrelated arguments."""
+        opts = self.network().split(":", 1)[1].split(",")
+        self.assertEqual(opts[0::2], ["-T", "-t"])
+        self.assertEqual(len(opts), 4)
+
+    def test_picks_the_first_free_block(self):
+        self.assertEqual(sandbx.pick_host_block(lambda port: True), 30010)
+
+    def test_skips_a_partly_taken_block(self):
+        self.assertEqual(sandbx.pick_host_block(lambda port: port != 30015), 30020)
+
+    def test_all_blocks_taken_is_a_clean_error(self):
+        with self.assertRaises(SandboxError) as ctx:
+            sandbx.pick_host_block(lambda port: False)
+        self.assertIn("30010-30099", str(ctx.exception))
+
+    def test_builder_rejects_an_unreserved_block(self):
+        for bad in (30000, 30015, 30100, 8080):
+            with self.subTest(block=bad):
+                with self.assertRaises(SandboxError):
+                    argv(host_block=bad)
+
+    def test_port_free_sees_a_live_listener(self):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen()
+            self.assertFalse(sandbx._port_free(sock.getsockname()[1]))
 
 
 class TestGuards(unittest.TestCase):

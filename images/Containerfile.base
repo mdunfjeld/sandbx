@@ -7,6 +7,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # ---- Base packages ----
 RUN apt-get update && apt-get install -y \
+    podman \
+    proxychains4 \
+    iproute2 \
     sudo \
     curl \
     git \

@@ -1,7 +1,8 @@
 # sandbx
 
-Run an AI coding agent in a disposable podman container where the only access to the host filesystem is the selected project
-directory and that agent's own credentials — nothing else.
+Run an AI coding agent in a disposable libkrun microVM, launched through podman,
+where the only access to the host filesystem is the selected project directory
+and that agent's own credentials — nothing else.
 
 ```sh
 ./install.sh                   # symlink sandbx into ~/.local/bin
@@ -9,7 +10,13 @@ sandbx build                   # build all images (once)
 sandbx claude ~/project        # launch
 ```
 
-The container is deleted on exit; the agent's config and session history persist.
+The VM is deleted on exit; the agent's config and session history persist.
+Several sandboxes can run at once.
+
+## Requirements
+
+- podman with the `krun` runtime: `sudo dnf install crun-krun` on Fedora.
+- `/dev/kvm`, readable and writable by you. sandbx checks before launching.
 
 ## Commands
 
@@ -35,10 +42,42 @@ Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe` (Mistral Vibe).
 | No host access beyond the project | Exactly two bind mounts: the project and that agent's state dir |
 | Agents can't read each other's credentials | Other agents' state dirs are not mounted at all |
 | Sandbox is disposable, data survives | `--rm`, bind mounts only |
+| A kernel exploit stays in the guest | Each sandbox is a libkrun microVM (`--runtime=krun`) with its own kernel |
+| Host network only through reserved ports | pasta forwards the ranges under [Ports](#ports), nothing else |
 
-Networking is `--network=host`, so an agent reaches host localhost services and
-the LAN. The kernel is shared. This limits blast radius; it is not a boundary
-against a kernel exploit.
+The agent still reaches the internet and your LAN. It doesn't reach host
+localhost services outside the reserved ports, or the host's abstract unix
+sockets (X11 and similar). The project mount stays read-write, so review what
+the agent leaves there (git hooks, `.envrc`, task files) before running it on
+the host.
+
+## Ports
+
+| Host ports | Direction | Use |
+| --- | --- | --- |
+| 30000–30009 | sandbox → host, shared by all sandboxes | 30000 adb server, 30001 Burp proxy, 30002 Burp MCP, 30003–30009 as needed |
+| 30010–30099 | host → sandbox, host `127.0.0.1` only | One block of 10 per sandbox, always seen inside as 30010–30019 |
+
+**Sandbox → host:** inside the VM, `127.0.0.1:30000`–`30009` reach the same
+ports on the host's localhost. Point host services there:
+
+```sh
+export ANDROID_ADB_SERVER_PORT=30000   # host shell rc; every host adb must use it
+adb start-server
+```
+
+In Burp, add proxy listeners on `127.0.0.1:30001` (and `30002` for the MCP
+server) next to whatever your phone uses. sandbx sets `ANDROID_ADB_SERVER_PORT`
+inside, so `adb devices` there talks to the host server. The client and server
+versions must match, or the client kills your host server. `adb forward` opens
+its listener on the host, so forward to a port in this range, e.g.
+`adb forward tcp:30003 tcp:27042` then `frida -H 127.0.0.1:30003`.
+
+**Host → sandbox:** a server the agent starts on 30010–30019 appears on the
+host's `127.0.0.1`. Each sandbox takes the first free block of 30010–30099 on
+launch (up to nine at once), prints it, and exposes it inside as
+`$SANDBX_HOST_PORTS`. The ranges must be free on the host:
+`ss -tln '( sport >= :30000 and sport <= :30099 )'`.
 
 ## State and logins
 
@@ -66,6 +105,12 @@ survives moving the project.
   confinement instead.
 - **Container user:** `agent`, uid 1000, via `--userns=keep-id:uid=1000,gid=1000`,
   so files come out owned by you. Passwordless `sudo`; installs vanish on exit.
+  The VM itself starts as root in the user namespace (`--user 0:0`), because
+  krun's VMM opens every file for the guest and as `agent` it can't open
+  root-owned ones, which breaks `sudo`. `setpriv` drops the agent (or the
+  `--shell` shell) to `agent` before it starts.
+- **VM size:** 4 GiB RAM per sandbox (libkrun's default is 1 GiB), committed
+  only as used. vCPUs default to every CPU sandbx may run on, up to 16.
 - **Shell first:** `--shell` builds the identical sandbox (same mounts and env)
   but runs `bash -l` instead of the agent. Set things up, then run `claude` (etc.)
   by hand in the same container; it all goes away when the shell exits. Can't

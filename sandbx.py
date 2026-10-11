@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an AI coding agent inside a disposable podman container.
+"""Run an AI coding agent inside a disposable libkrun microVM, launched through podman.
 
 Each agent gets exactly one config mount and one project mount. Isolation is
 structural rather than policy-based: a claude container has no copilot
@@ -16,11 +16,12 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 CONTAINER_USER = "agent"
 CONTAINER_UID = 1000
@@ -32,7 +33,38 @@ WORKDIR_TEMPLATE = "/workspace/{name}"
 # Run instead of the agent under --shell. Same as the base image's CMD, but
 # spelled out so the argv stays pure and testable.
 SHELL_COMMAND = ("/bin/bash", "-l")
+# Prefixed to whatever runs in the VM. The VM itself starts as root (see the
+# --user comment in build_podman_args); this drops the agent, or the --shell
+# shell, to `agent` inside the guest before it starts.
+AS_AGENT = ("setpriv", f"--reuid={CONTAINER_UID}", f"--regid={CONTAINER_UID}",
+            "--init-groups", "--")
 IMAGES_DIR = Path(__file__).resolve().parent / "images"
+
+# Every sandbox is a libkrun microVM: crun sets the container up as usual, then
+# hands the process to libkrun, which boots the workload under its own kernel.
+# A kernel exploit lands in the guest rather than on the host. Needs crun-krun
+# and /dev/kvm.
+VM_RUNTIME = "krun"
+# libkrun's default is 1 GiB, too little for npm or gradle. Guest memory is only
+# committed as it is used, so several sandboxes of this size still fit.
+VM_RAM_MIB = 4096
+
+# Networking is pasta with a fixed set of forwards, instead of --network=host,
+# which handed over every localhost service and abstract unix socket.
+#
+# Outbound (-T): 127.0.0.1:30000-30009 inside reaches the same ports on the
+# host. pasta listens inside each sandbox's own namespace, so any number of
+# sandboxes share this range -- and the host's adb server and Burp with it.
+TO_HOST_PORTS = (30000, 30009)
+# adb defaults to 5037, outside the range. The host server must use this too.
+ADB_SERVER_PORT = 30000
+# Inbound (-t): servers the agent starts on 30010-30019 appear on the host's
+# 127.0.0.1. Those are host ports, so a fixed range would let only one sandbox
+# start; each takes the first free block of HOST_BLOCKS instead, and pasta
+# remaps it onto INBOUND_PORTS. The two directions must never overlap, or the
+# forwards loop into each other.
+INBOUND_PORTS = (30010, 30019)
+HOST_BLOCKS = range(30010, 30100, 10)
 
 
 class SandboxError(Exception):
@@ -262,6 +294,54 @@ def mount_spec(src: str, dest: str, suffix: str) -> str:
     return f"{src}:{dest}{suffix}"
 
 
+def port_span(ports: tuple[int, int]) -> str:
+    """Render a (first, last) pair the way pasta and humans both read it."""
+    return f"{ports[0]}-{ports[1]}"
+
+
+def host_ports(block: int) -> tuple[int, int]:
+    """The host side of one inbound block: as wide as INBOUND_PORTS."""
+    return block, block + INBOUND_PORTS[1] - INBOUND_PORTS[0]
+
+
+def _port_free(port: int) -> bool:
+    """Whether 127.0.0.1:port could be listened on right now.
+
+    SO_REUSEADDR so that connections lingering in TIME_WAIT -- left behind by a
+    sandbox that just exited -- don't count as taken; only a live listener does.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def pick_host_block(port_free: Callable[[int], bool] = _port_free) -> int:
+    """The first block of HOST_BLOCKS whose ports are all free on the host.
+
+    Check now, bind later: a port taken in between makes podman fail with
+    pasta's bind error, and a rerun picks another block. Closing that gap would
+    mean holding the sockets across exec, which pasta cannot take over anyway.
+    """
+    for block in HOST_BLOCKS:
+        first, last = host_ports(block)
+        if all(port_free(port) for port in range(first, last + 1)):
+            return block
+    span = (HOST_BLOCKS[0], host_ports(HOST_BLOCKS[-1])[1])
+    raise SandboxError(
+        f"no free inbound port block in {port_span(span)}: {len(HOST_BLOCKS)} "
+        "sandboxes are already running, or something else holds those ports"
+    )
+
+
+def have_kvm() -> bool:
+    """Whether this user can open /dev/kvm, which every microVM needs."""
+    return os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
 def build_podman_args(
     name: str,
     project: Path,
@@ -271,12 +351,16 @@ def build_podman_args(
     interactive: bool = True,
     extra: Sequence[str] = (),
     shell: bool = False,
+    host_block: int = HOST_BLOCKS[0],
 ) -> list[str]:
     """Construct the full podman argv. Pure, so tests can assert the isolation
     invariants directly instead of eyeballing a command line.
 
     shell=True swaps only the trailing command for SHELL_COMMAND; the sandbox
     itself is identical, so the agent can be started by hand inside it.
+
+    host_block is this sandbox's share of the inbound host ports; cmd_run picks
+    it with pick_host_block(), since that part needs to look at the host.
     """
     try:
         agent = AGENTS[name]
@@ -288,6 +372,12 @@ def build_podman_args(
     validate_agent(name, agent)
     if shell and extra:
         raise SandboxError("--shell cannot be combined with -- ARGS")
+    if host_block not in HOST_BLOCKS:
+        raise SandboxError(
+            f"host port block {host_block} is not one of the reserved blocks "
+            f"({', '.join(map(str, HOST_BLOCKS))})"
+        )
+    inbound_host = port_span(host_ports(host_block))
 
     config_src = agents_root / agent.state_dir
     # ":z" (shared), not ":Z" (private). Containers here are ephemeral and get a
@@ -307,14 +397,26 @@ def build_podman_args(
             f"({agent.config_path})"
         )
 
-    args = ["podman", "run", "--rm"]
+    args = ["podman", "run", "--rm", f"--runtime={VM_RUNTIME}"]
     if interactive:
         args.append("-it")
     args += [
         # Pinned rather than bare keep-id: bare would map whatever the host uid
         # happens to be, which only lines up with `agent` when that uid is 1000.
         f"--userns=keep-id:uid={CONTAINER_UID},gid={CONTAINER_UID}",
-        "--network=host",
+        # krun runs the VMM as the container user, and the VMM is what opens
+        # every file the guest touches. As `agent` it cannot open root-owned
+        # files, so sudo and every root write in the guest fail with EACCES.
+        # Root here is root in the user namespace -- the identity sudo had
+        # before krun, not host root. AS_AGENT drops the workload back to
+        # `agent`, and virtio-fs creates files with the requesting guest uid, so
+        # through keep-id they still come out owned by you.
+        "--user", "0:0",
+        # Podman splits pasta options on commas, so no single spec may hold
+        # one -- ranges only, never lists or `auto` combined with a range.
+        f"--network=pasta:-T,{port_span(TO_HOST_PORTS)},"
+        f"-t,127.0.0.1/{inbound_host}:{port_span(INBOUND_PORTS)}",
+        "--annotation", f"krun.ram_mib={VM_RAM_MIB}",
     ]
     if not relabel:
         args += ["--security-opt", "label=disable"]
@@ -322,11 +424,17 @@ def build_podman_args(
         "-v", mount_spec(str(config_src), agent.config_path, suffix),
         "-v", mount_spec(str(project), dest, suffix),
         "-w", dest,
+        # Podman derives HOME from --user, which would make it /root.
+        "-e", f"HOME={CONTAINER_HOME}",
         "-e", f"SANDBX_AGENT={name}",
+        # Where the agent's INBOUND_PORTS show up on the host, so it can say so.
+        "-e", f"SANDBX_HOST_PORTS={inbound_host}",
+        "-e", f"ANDROID_ADB_SERVER_PORT={ADB_SERVER_PORT}",
     ]
     for key, value in agent.env.items():
         args += ["-e", f"{key}={value}"]
     args.append(agent.image)
+    args += list(AS_AGENT)
     if shell:
         args += list(SHELL_COMMAND)
     else:
@@ -379,6 +487,8 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
     agents_root = state_root()
     validate_project(project, home_dir(), agents_root)
 
+    # Picked for --dry-run too, so the printed command is the one that would run.
+    host_block = pick_host_block()
     args = build_podman_args(
         name, project,
         agents_root=agents_root,
@@ -386,6 +496,7 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
         interactive=sys.stdin.isatty(),
         extra=passthrough,
         shell=opts.shell,
+        host_block=host_block,
     )
 
     if opts.dry_run:
@@ -394,10 +505,17 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
 
     if shutil.which("podman") is None:
         raise SandboxError("podman not found on PATH")
+    if not have_kvm():
+        raise SandboxError(
+            "cannot open /dev/kvm; every sandbox is a microVM and needs KVM. "
+            "Check that virtualization is enabled and /dev/kvm is read-write for you"
+        )
 
     # Bind mounts get no copy-up, so podman would create this root-owned. Do it
-    # after the podman check so a failed launch leaves no stray state behind.
+    # after the checks above so a failed launch leaves no stray state behind.
     (agents_root / AGENTS[name].state_dir).mkdir(parents=True, exist_ok=True)
+    print(f"sandbx: host 127.0.0.1:{port_span(host_ports(host_block))} -> "
+          f"sandbox :{port_span(INBOUND_PORTS)}", file=sys.stderr)
     if opts.shell:
         print(f"sandbx: {name} not started; run "
               f"`{shlex.join(AGENTS[name].command)}` to launch it", file=sys.stderr)
