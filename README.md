@@ -2,7 +2,8 @@
 
 Run an AI coding agent in a disposable libkrun microVM, launched through podman,
 where the only access to the host filesystem is the selected project directory
-and that agent's own credentials — nothing else.
+and that agent's own credentials — nothing else. `--runtime crun` runs a plain
+podman container instead, for hosts without KVM.
 
 ```sh
 ./install.sh                   # symlink sandbx into ~/.local/bin
@@ -18,6 +19,8 @@ Several sandboxes can run at once.
 - podman with the `krun` runtime: `sudo dnf install crun-krun` on Fedora.
 - `/dev/kvm`, readable and writable by you. sandbx checks before launching.
 
+`--runtime crun` needs neither, only podman.
+
 ## Commands
 
 ```
@@ -26,6 +29,8 @@ sandbx <agent> [path] -- ARGS...   # pass ARGS to the agent
 sandbx <agent> [path] -s|--shell   # bash in the sandbox; start the agent yourself
 sandbx <agent> --dry-run           # print the podman command, run nothing
 sandbx <agent> --no-relabel        # skip SELinux :z relabeling
+sandbx <agent> --ram 8G --cpus 4   # size the VM, krun only (see VM size under Details)
+sandbx <agent> --runtime crun      # plain container, no VM (see Runtime under Details)
 sandbx build [agent]               # all agents; base only if missing
 sandbx build --base                # rebuild the base image too
 sandbx build --no-cache            # reinstall the agent CLIs (see Updating)
@@ -42,7 +47,7 @@ Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe` (Mistral Vibe).
 | No host access beyond the project | Exactly two bind mounts: the project and that agent's state dir |
 | Agents can't read each other's credentials | Other agents' state dirs are not mounted at all |
 | Sandbox is disposable, data survives | `--rm`, bind mounts only |
-| A kernel exploit stays in the guest | Each sandbox is a libkrun microVM (`--runtime=krun`) with its own kernel |
+| A kernel exploit stays in the guest | Each sandbox is a libkrun microVM (`--runtime=krun`) with its own kernel. Not with `--runtime crun` |
 | Host network only through reserved ports | pasta forwards the ranges under [Ports](#ports), nothing else |
 
 The agent still reaches the internet and your LAN. It doesn't reach host
@@ -56,7 +61,7 @@ the host.
 | Host ports | Direction | Use |
 | --- | --- | --- |
 | 30000–30009 | sandbox → host, shared by all sandboxes | 30000 adb server, 30001 Burp proxy, 30002 Burp MCP, 30003–30009 as needed |
-| 30010–30099 | host → sandbox, host `127.0.0.1` only | One block of 10 per sandbox, always seen inside as 30010–30019 |
+| 30010–30099 | host → sandbox, host `127.0.0.1` only | One block of 10 per sandbox, same port numbers inside and on the host |
 
 **Sandbox → host:** inside the VM, `127.0.0.1:30000`–`30009` reach the same
 ports on the host's localhost. Point host services there:
@@ -73,10 +78,11 @@ versions must match, or the client kills your host server. `adb forward` opens
 its listener on the host, so forward to a port in this range, e.g.
 `adb forward tcp:30003 tcp:27042` then `frida -H 127.0.0.1:30003`.
 
-**Host → sandbox:** a server the agent starts on 30010–30019 appears on the
-host's `127.0.0.1`. Each sandbox takes the first free block of 30010–30099 on
+**Host → sandbox:** each sandbox takes the first free block of 30010–30099 on
 launch (up to nine at once), prints it, and exposes it inside as
-`$SANDBX_HOST_PORTS`. The ranges must be free on the host:
+`$SANDBX_HOST_PORTS`. A server the agent starts on one of those ports appears
+on the same port of the host's `127.0.0.1`: the second sandbox serves on
+30020–30029, and you open 30020–30029. The ranges must be free on the host:
 `ss -tln '( sport >= :30000 and sport <= :30099 )'`.
 
 ## State and logins
@@ -98,6 +104,11 @@ survives moving the project.
 
 ## Details
 
+- **Runtime:** `krun` by default: a microVM with its own kernel. `--runtime crun`
+  is podman's usual runtime: a namespaced container on the host kernel, so a
+  kernel exploit reaches the host. Use it where there's no KVM. Mounts, network
+  and env are the same in both. `$SANDBX_RUNTIME` says which one you're in.
+  The VM options (`--ram`, `--cpus`) are refused under crun, not ignored.
 - **Refused paths:** `/`, `$HOME`, anything containing or inside the state dir,
   and any path with `:` (podman's `-v` can't escape it). Symlinks are resolved first.
 - **SELinux:** mounts use `:z`, which relabels the project to `container_file_t`
@@ -108,9 +119,13 @@ survives moving the project.
   The VM itself starts as root in the user namespace (`--user 0:0`), because
   krun's VMM opens every file for the guest and as `agent` it can't open
   root-owned ones, which breaks `sudo`. `setpriv` drops the agent (or the
-  `--shell` shell) to `agent` before it starts.
-- **VM size:** 4 GiB RAM per sandbox (libkrun's default is 1 GiB), committed
+  `--shell` shell) to `agent` before it starts. crun has no VMM in the way, so
+  it starts as `agent` directly (`--user 1000:1000`).
+- **VM size (krun only):** 4 GiB RAM per sandbox (libkrun's default is 1 GiB), committed
   only as used. vCPUs default to every CPU sandbx may run on, up to 16.
+  `--ram` (`8G`, `512M`, or plain MiB) and `--cpus` override them per launch.
+  RAM must be over 128 MiB, because crun quietly swaps anything smaller for
+  1 GiB. vCPUs go from 1 to 16, libkrun's hard limit.
 - **Shell first:** `--shell` builds the identical sandbox (same mounts and env)
   but runs `bash -l` instead of the agent. Set things up, then run `claude` (etc.)
   by hand in the same container; it all goes away when the shell exits. Can't

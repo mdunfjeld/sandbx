@@ -39,8 +39,11 @@ PROJECT = Path("/home/tester/work/myproject")
 OPTION_SETS = [
     {}, {"relabel": False}, {"interactive": False},
     {"extra": ["--resume"]}, {"shell": True}, {"host_block": 30090},
+    {"ram_mib": 8192, "cpus": 4},
     {"relabel": False, "interactive": False},
     {"shell": True, "relabel": False, "interactive": False},
+    {"runtime": "crun"},
+    {"runtime": "crun", "shell": True, "relabel": False, "interactive": False},
 ]
 
 
@@ -257,11 +260,11 @@ class TestFlags(unittest.TestCase):
 
     def test_pasta_forwards_only_the_reserved_ranges(self):
         self.assertIn(
-            "--network=pasta:-T,30000-30009,-t,127.0.0.1/30010-30019:30010-30019",
+            "--network=pasta:-T,30000-30009,-t,127.0.0.1/30010-30019",
             argv(),
         )
         self.assertIn(
-            "--network=pasta:-T,30000-30009,-t,127.0.0.1/30040-30049:30010-30019",
+            "--network=pasta:-T,30000-30009,-t,127.0.0.1/30040-30049",
             argv(host_block=30040),
         )
 
@@ -281,8 +284,9 @@ class TestFlags(unittest.TestCase):
         self.assertEqual(args[args.index("--user") + 1], "0:0")
         self.assertIn(f"HOME={sandbx.CONTAINER_HOME}", args)
 
-    def test_workload_always_drops_to_agent(self):
-        """Root is for the VMM only; whatever runs in the guest runs as agent."""
+    def test_workload_always_runs_as_agent(self):
+        """Root is for the krun VMM only; whatever runs inside runs as agent.
+        A VM drops there through AS_AGENT, a crun container starts there."""
         self.assertIn(f"--reuid={sandbx.CONTAINER_UID}", sandbx.AS_AGENT)
         self.assertIn(f"--regid={sandbx.CONTAINER_UID}", sandbx.AS_AGENT)
         for kw in OPTION_SETS:
@@ -290,10 +294,14 @@ class TestFlags(unittest.TestCase):
                 with self.subTest(agent=name, opts=kw):
                     args = argv(name, **kw)
                     start = args.index(agent.image) + 1
-                    self.assertEqual(
-                        args[start:start + len(sandbx.AS_AGENT)],
-                        list(sandbx.AS_AGENT),
-                    )
+                    if kw.get("runtime") == "crun":
+                        self.assertEqual(args[args.index("--user") + 1], "1000:1000")
+                        self.assertNotIn("setpriv", args)
+                    else:
+                        self.assertEqual(
+                            args[start:start + len(sandbx.AS_AGENT)],
+                            list(sandbx.AS_AGENT),
+                        )
 
     def test_vm_memory_is_set(self):
         """libkrun's 1 GiB default is too small; unset, builds run out of RAM."""
@@ -406,7 +414,8 @@ class TestShellMode(CliRunner, unittest.TestCase):
 
     def test_sandbox_is_identical_up_to_the_image(self):
         for name, agent in AGENTS.items():
-            for kw in [{}, {"relabel": False}, {"interactive": False}]:
+            for kw in [{}, {"relabel": False}, {"interactive": False},
+                       {"runtime": "crun"}]:
                 with self.subTest(agent=name, opts=kw):
                     normal = argv(name, **kw)
                     shell = argv(name, shell=True, **kw)
@@ -448,7 +457,8 @@ class TestShellMode(CliRunner, unittest.TestCase):
     def test_normal_run_prints_only_the_port_line(self):
         _, _, err = self.run_cli("claude", [], real=True)
         self.assertEqual(
-            err, "sandbx: host 127.0.0.1:30010-30019 -> sandbox :30010-30019\n")
+            err, "sandbx: ports 30010-30019 inside reach the same ports on host "
+                 "127.0.0.1\n")
         self.assertEqual(self.execvp.call_args.args[1][-1], "claude")
 
 
@@ -466,6 +476,158 @@ class TestKvmCheck(CliRunner, unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("--runtime=krun", out)
 
+    def test_crun_runs_without_kvm(self):
+        self.run_cli("claude", ["--runtime", "crun"], real=True, kvm=False)
+        self.assertIn("--runtime=crun", self.execvp.call_args.args[1])
+
+
+def annotations(args):
+    """Every --annotation value, in order."""
+    return [args[i + 1] for i, tok in enumerate(args) if tok == "--annotation"]
+
+
+class TestVmSize(CliRunner, unittest.TestCase):
+    """--ram and --cpus reach crun as krun annotations, and only in a range crun
+    honours: out of it, crun swaps in its own default or libkrun refuses."""
+
+    def test_defaults_set_ram_and_leave_cpus_to_crun(self):
+        self.assertEqual(annotations(argv()), ["krun.ram_mib=4096"])
+
+    def test_ram_and_cpus_pass_through(self):
+        self.assertEqual(annotations(argv(ram_mib=8192, cpus=4)),
+                         ["krun.ram_mib=8192", "krun.cpus=4"])
+
+    def test_ram_crun_would_ignore_is_rejected(self):
+        for ram in (0, 64, sandbx.VM_MIN_RAM_MIB):
+            with self.subTest(ram=ram), self.assertRaises(SandboxError):
+                argv(ram_mib=ram)
+        self.assertIn("krun.ram_mib=129",
+                      annotations(argv(ram_mib=sandbx.VM_MIN_RAM_MIB + 1)))
+
+    def test_cpus_outside_libkrun_range_are_rejected(self):
+        for cpus in (0, -1, sandbx.VM_MAX_CPUS + 1):
+            with self.subTest(cpus=cpus), self.assertRaises(SandboxError):
+                argv(cpus=cpus)
+        for cpus in (1, sandbx.VM_MAX_CPUS):
+            with self.subTest(cpus=cpus):
+                self.assertIn(f"krun.cpus={cpus}", annotations(argv(cpus=cpus)))
+
+    def test_parse_ram_units(self):
+        cases = {"4096": 4096, "512M": 512, "512m": 512, "8G": 8192, "8g": 8192}
+        for raw, mib in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(sandbx.parse_ram(raw), mib)
+
+    def test_parse_ram_rejects_other_forms(self):
+        for raw in ("", "8T", "1.5G", "-1", "G", "8 G", "8GB"):
+            with self.subTest(raw=raw), self.assertRaises(
+                    sandbx.argparse.ArgumentTypeError):
+                sandbx.parse_ram(raw)
+
+    def test_cli_flags_reach_the_command(self):
+        rc, out, _ = self.run_cli("claude", ["--ram", "8G", "--cpus", "2", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(annotations(shlex.split(out)),
+                         ["krun.ram_mib=8192", "krun.cpus=2"])
+
+    def test_cli_rejects_a_bad_size_or_count(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("claude", ["--ram", "lots", "--dry-run"])
+        with self.assertRaises(SystemExit):
+            self.run_cli("claude", ["--cpus", "two", "--dry-run"])
+        with self.assertRaises(SandboxError):
+            self.run_cli("claude", ["--cpus", "32", "--dry-run"])
+
+    def test_cli_default_ram_comes_from_the_builder(self):
+        _, out, _ = self.run_cli("claude", ["--dry-run"])
+        self.assertEqual(annotations(shlex.split(out)), ["krun.ram_mib=4096"])
+
+
+def without_runtime(args):
+    """The argv minus everything that is allowed to differ between runtimes:
+    the runtime itself, the VM annotations, and how the workload becomes agent."""
+    args, n = list(args), len(sandbx.AS_AGENT)
+    for i in range(len(args) - n + 1):
+        if args[i:i + n] == list(sandbx.AS_AGENT):
+            del args[i:i + n]
+            break
+    out, i = [], 0
+    while i < len(args):
+        if args[i] in ("--annotation", "--user"):
+            i += 2
+            continue
+        if args[i].startswith("--runtime=") or args[i].startswith("SANDBX_RUNTIME="):
+            out.append("<runtime>")
+        else:
+            out.append(args[i])
+        i += 1
+    return out
+
+
+class TestRuntime(CliRunner, unittest.TestCase):
+    """crun swaps the microVM for a plain container. Everything else about the
+    sandbox stays put, and VM-only options are refused rather than dropped."""
+
+    def test_krun_is_the_default(self):
+        self.assertEqual(argv()[3], "--runtime=krun")
+        self.assertIn("SANDBX_RUNTIME=krun", argv())
+
+    def test_crun_is_passed_explicitly(self):
+        """Explicit, so a podman that defaults to runc still gets crun."""
+        args = argv(runtime="crun")
+        self.assertEqual(args[3], "--runtime=crun")
+        self.assertIn("SANDBX_RUNTIME=crun", args)
+
+    def test_crun_gets_no_vm_annotations(self):
+        self.assertEqual(annotations(argv(runtime="crun")), [])
+
+    def test_crun_starts_as_agent_directly(self):
+        """No VMM needs root there, so there is no root start to drop from."""
+        for name, agent in AGENTS.items():
+            for shell, command in ((False, agent.command),
+                                   (True, sandbx.SHELL_COMMAND)):
+                with self.subTest(agent=name, shell=shell):
+                    args = argv(name, runtime="crun", shell=shell)
+                    self.assertEqual(args[args.index("--user") + 1], "1000:1000")
+                    tail = args[args.index(agent.image) + 1:]
+                    self.assertEqual(tail, list(command))
+
+    def test_same_sandbox_under_either_runtime(self):
+        for kw in [{}, {"shell": True}, {"relabel": False, "interactive": False}]:
+            for name in AGENTS:
+                with self.subTest(agent=name, opts=kw):
+                    self.assertEqual(without_runtime(argv(name, runtime="crun", **kw)),
+                                     without_runtime(argv(name, **kw)))
+
+    def test_builder_rejects_an_unknown_runtime(self):
+        for bad in ("runc", "", "KRUN"):
+            with self.subTest(runtime=bad), self.assertRaises(SandboxError):
+                argv(runtime=bad)
+
+    def test_builder_rejects_vm_sizing_under_crun(self):
+        for kw in ({"ram_mib": 8192}, {"cpus": 2}, {"ram_mib": 8192, "cpus": 2}):
+            with self.subTest(opts=kw), self.assertRaises(SandboxError):
+                argv(runtime="crun", **kw)
+
+    def test_cli_selects_crun(self):
+        rc, out, _ = self.run_cli("claude", ["--runtime", "crun", "--dry-run"])
+        self.assertEqual(rc, 0)
+        args = shlex.split(out)
+        self.assertIn("--runtime=crun", args)
+        self.assertEqual(annotations(args), [])
+        self.assertEqual(args[-2:], ["sandbx-claude", "claude"])
+
+    def test_cli_refuses_vm_options_under_crun(self):
+        for flags in (["--ram", "8G"], ["--cpus", "2"], ["--ram", "4G", "--cpus", "1"]):
+            with self.subTest(flags=flags):
+                with self.assertRaises(SystemExit) as ctx:
+                    self.run_cli("claude", ["--runtime", "crun", *flags, "--dry-run"])
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_cli_rejects_an_unknown_runtime(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("claude", ["--runtime", "runc", "--dry-run"])
+
 
 class TestPorts(unittest.TestCase):
     """The reserved ranges. An overlap would loop the forwards into each other;
@@ -481,20 +643,26 @@ class TestPorts(unittest.TestCase):
         seen = self.ports(sandbx.TO_HOST_PORTS)
         for block in sandbx.HOST_BLOCKS:
             with self.subTest(block=block):
-                ports = self.ports(sandbx.host_ports(block))
+                ports = self.ports(sandbx.block_ports(block))
                 self.assertFalse(ports & seen)
                 seen |= ports
 
-    def test_inside_ranges_are_disjoint(self):
-        """-T listeners and the agent's inbound ports share the VM's namespace."""
-        self.assertFalse(
-            self.ports(sandbx.INBOUND_PORTS) & self.ports(sandbx.TO_HOST_PORTS))
-
-    def test_every_block_is_as_wide_as_the_inbound_range(self):
-        width = len(self.ports(sandbx.INBOUND_PORTS))
+    def test_every_block_is_block_size_wide(self):
         for block in sandbx.HOST_BLOCKS:
             with self.subTest(block=block):
-                self.assertEqual(len(self.ports(sandbx.host_ports(block))), width)
+                self.assertEqual(len(self.ports(sandbx.block_ports(block))),
+                                 sandbx.BLOCK_SIZE)
+
+    def test_inbound_ports_are_the_same_inside_and_on_the_host(self):
+        """A remap (`host:inside`) made $SANDBX_HOST_PORTS wrong inside the
+        sandbox for every block but the first."""
+        for block in sandbx.HOST_BLOCKS:
+            with self.subTest(block=block):
+                args = argv(host_block=block)
+                span = sandbx.port_span(sandbx.block_ports(block))
+                inbound = self.network(host_block=block).split(",-t,", 1)[1]
+                self.assertEqual(inbound, f"127.0.0.1/{span}")
+                self.assertIn(f"SANDBX_HOST_PORTS={span}", args)
 
     def test_adb_port_is_forwarded_to_the_host(self):
         self.assertIn(sandbx.ADB_SERVER_PORT, self.ports(sandbx.TO_HOST_PORTS))

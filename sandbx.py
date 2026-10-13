@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run an AI coding agent inside a disposable libkrun microVM, launched through podman.
+With --runtime crun it is a plain podman container instead.
 
 Each agent gets exactly one config mount and one project mount. Isolation is
 structural rather than policy-based: a claude container has no copilot
@@ -33,21 +34,32 @@ WORKDIR_TEMPLATE = "/workspace/{name}"
 # Run instead of the agent under --shell. Same as the base image's CMD, but
 # spelled out so the argv stays pure and testable.
 SHELL_COMMAND = ("/bin/bash", "-l")
-# Prefixed to whatever runs in the VM. The VM itself starts as root (see the
+# Prefixed to whatever runs in a krun VM. The VM itself starts as root (see the
 # --user comment in build_podman_args); this drops the agent, or the --shell
-# shell, to `agent` inside the guest before it starts.
+# shell, to `agent` inside the guest before it starts. crun needs no prefix.
 AS_AGENT = ("setpriv", f"--reuid={CONTAINER_UID}", f"--regid={CONTAINER_UID}",
             "--init-groups", "--")
 IMAGES_DIR = Path(__file__).resolve().parent / "images"
 
-# Every sandbox is a libkrun microVM: crun sets the container up as usual, then
-# hands the process to libkrun, which boots the workload under its own kernel.
-# A kernel exploit lands in the guest rather than on the host. Needs crun-krun
-# and /dev/kvm.
+# By default a sandbox is a libkrun microVM: crun sets the container up as
+# usual, then hands the process to libkrun, which boots the workload under its
+# own kernel. A kernel exploit lands in the guest rather than on the host. Needs
+# crun-krun and /dev/kvm.
 VM_RUNTIME = "krun"
+# podman's usual runtime: an ordinary namespaced container on the host kernel.
+# Weaker isolation, but no KVM needed. Same mounts and network as krun, but it
+# starts as `agent` directly, and the VM-sizing options below do not apply.
+CONTAINER_RUNTIME = "crun"
+RUNTIMES = (VM_RUNTIME, CONTAINER_RUNTIME)
 # libkrun's default is 1 GiB, too little for npm or gradle. Guest memory is only
 # committed as it is used, so several sandboxes of this size still fit.
 VM_RAM_MIB = 4096
+# crun quietly swaps a krun.ram_mib at or below this for libkrun's 1 GiB
+# default, so a smaller --ram would grow the VM rather than shrink it. Refused.
+VM_MIN_RAM_MIB = 128
+# libkrun's hard limit. With no krun.cpus, crun gives the VM every CPU sandbx
+# may run on, capped at this.
+VM_MAX_CPUS = 16
 
 # Networking is pasta with a fixed set of forwards, instead of --network=host,
 # which handed over every localhost service and abstract unix socket.
@@ -58,13 +70,14 @@ VM_RAM_MIB = 4096
 TO_HOST_PORTS = (30000, 30009)
 # adb defaults to 5037, outside the range. The host server must use this too.
 ADB_SERVER_PORT = 30000
-# Inbound (-t): servers the agent starts on 30010-30019 appear on the host's
-# 127.0.0.1. Those are host ports, so a fixed range would let only one sandbox
-# start; each takes the first free block of HOST_BLOCKS instead, and pasta
-# remaps it onto INBOUND_PORTS. The two directions must never overlap, or the
-# forwards loop into each other.
-INBOUND_PORTS = (30010, 30019)
-HOST_BLOCKS = range(30010, 30100, 10)
+# Inbound (-t): each sandbox takes the first free block of HOST_BLOCKS, and a
+# server the agent starts on one of its ports appears on the same port of the
+# host's 127.0.0.1. Those are host ports, so a fixed range would let only one
+# sandbox start. The numbers match on both sides on purpose: $SANDBX_HOST_PORTS
+# is then right wherever you read it. The two directions must never overlap,
+# or the forwards loop into each other.
+BLOCK_SIZE = 10
+HOST_BLOCKS = range(30010, 30100, BLOCK_SIZE)
 
 
 class SandboxError(Exception):
@@ -299,9 +312,9 @@ def port_span(ports: tuple[int, int]) -> str:
     return f"{ports[0]}-{ports[1]}"
 
 
-def host_ports(block: int) -> tuple[int, int]:
-    """The host side of one inbound block: as wide as INBOUND_PORTS."""
-    return block, block + INBOUND_PORTS[1] - INBOUND_PORTS[0]
+def block_ports(block: int) -> tuple[int, int]:
+    """First and last port of one inbound block, the same inside and on the host."""
+    return block, block + BLOCK_SIZE - 1
 
 
 def _port_free(port: int) -> bool:
@@ -327,10 +340,10 @@ def pick_host_block(port_free: Callable[[int], bool] = _port_free) -> int:
     mean holding the sockets across exec, which pasta cannot take over anyway.
     """
     for block in HOST_BLOCKS:
-        first, last = host_ports(block)
+        first, last = block_ports(block)
         if all(port_free(port) for port in range(first, last + 1)):
             return block
-    span = (HOST_BLOCKS[0], host_ports(HOST_BLOCKS[-1])[1])
+    span = (HOST_BLOCKS[0], block_ports(HOST_BLOCKS[-1])[1])
     raise SandboxError(
         f"no free inbound port block in {port_span(span)}: {len(HOST_BLOCKS)} "
         "sandboxes are already running, or something else holds those ports"
@@ -340,6 +353,21 @@ def pick_host_block(port_free: Callable[[int], bool] = _port_free) -> int:
 def have_kvm() -> bool:
     """Whether this user can open /dev/kvm, which every microVM needs."""
     return os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+
+_RAM_SIZE = re.compile(r"(\d+)([MG]?)", re.IGNORECASE)
+
+
+def parse_ram(value: str) -> int:
+    """--ram as MiB: a bare number is MiB, or give an M or G suffix. The range
+    is build_podman_args()'s to check, so every caller gets the same rule."""
+    match = _RAM_SIZE.fullmatch(value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid size {value!r}; give MiB (8192) or a G or M suffix (8G)"
+        )
+    amount = int(match[1])
+    return amount * 1024 if match[2].upper() == "G" else amount
 
 
 def build_podman_args(
@@ -352,6 +380,9 @@ def build_podman_args(
     extra: Sequence[str] = (),
     shell: bool = False,
     host_block: int = HOST_BLOCKS[0],
+    runtime: str = VM_RUNTIME,
+    ram_mib: int | None = None,
+    cpus: int | None = None,
 ) -> list[str]:
     """Construct the full podman argv. Pure, so tests can assert the isolation
     invariants directly instead of eyeballing a command line.
@@ -361,6 +392,13 @@ def build_podman_args(
 
     host_block is this sandbox's share of the inbound host ports; cmd_run picks
     it with pick_host_block(), since that part needs to look at the host.
+
+    runtime is one of RUNTIMES. Mounts, network and env are the same under
+    each; what differs is the runtime flag, the VM annotations, SANDBX_RUNTIME,
+    and how the workload becomes `agent` (see the --user comment).
+
+    ram_mib and cpus size the VM, so they are refused unless runtime is krun.
+    ram_mib=None means VM_RAM_MIB; cpus=None leaves the count to crun.
     """
     try:
         agent = AGENTS[name]
@@ -377,7 +415,27 @@ def build_podman_args(
             f"host port block {host_block} is not one of the reserved blocks "
             f"({', '.join(map(str, HOST_BLOCKS))})"
         )
-    inbound_host = port_span(host_ports(host_block))
+    if runtime not in RUNTIMES:
+        raise SandboxError(
+            f"unknown runtime {runtime!r} (known: {', '.join(RUNTIMES)})"
+        )
+    if runtime == VM_RUNTIME:
+        if ram_mib is None:
+            ram_mib = VM_RAM_MIB
+        if ram_mib <= VM_MIN_RAM_MIB:
+            raise SandboxError(
+                f"--ram must be more than {VM_MIN_RAM_MIB} MiB; crun replaces "
+                f"anything smaller with libkrun's 1 GiB default"
+            )
+        if cpus is not None and not 1 <= cpus <= VM_MAX_CPUS:
+            raise SandboxError(
+                f"--cpus must be 1-{VM_MAX_CPUS}, libkrun's limit; got {cpus}"
+            )
+    elif ram_mib is not None or cpus is not None:
+        raise SandboxError(
+            f"--ram and --cpus size a microVM; they need --runtime {VM_RUNTIME}"
+        )
+    inbound = port_span(block_ports(host_block))
 
     config_src = agents_root / agent.state_dir
     # ":z" (shared), not ":Z" (private). Containers here are ephemeral and get a
@@ -397,44 +455,55 @@ def build_podman_args(
             f"({agent.config_path})"
         )
 
-    args = ["podman", "run", "--rm", f"--runtime={VM_RUNTIME}"]
+    # krun runs the VMM as the container user, and the VMM is what opens every
+    # file the guest touches. As `agent` it cannot open root-owned files, so
+    # sudo and every root write in the guest fail with EACCES. So a VM starts
+    # as root in the user namespace -- the identity sudo had before krun, not
+    # host root -- and AS_AGENT drops the workload back to `agent`. virtio-fs
+    # creates files with the requesting guest uid, so through keep-id they
+    # still come out owned by you. crun has no VMM in the way and starts as
+    # `agent` directly.
+    vm = runtime == VM_RUNTIME
+    user = "0:0" if vm else f"{CONTAINER_UID}:{CONTAINER_UID}"
+
+    args = ["podman", "run", "--rm", f"--runtime={runtime}"]
     if interactive:
         args.append("-it")
     args += [
         # Pinned rather than bare keep-id: bare would map whatever the host uid
         # happens to be, which only lines up with `agent` when that uid is 1000.
         f"--userns=keep-id:uid={CONTAINER_UID},gid={CONTAINER_UID}",
-        # krun runs the VMM as the container user, and the VMM is what opens
-        # every file the guest touches. As `agent` it cannot open root-owned
-        # files, so sudo and every root write in the guest fail with EACCES.
-        # Root here is root in the user namespace -- the identity sudo had
-        # before krun, not host root. AS_AGENT drops the workload back to
-        # `agent`, and virtio-fs creates files with the requesting guest uid, so
-        # through keep-id they still come out owned by you.
-        "--user", "0:0",
+        "--user", user,
         # Podman splits pasta options on commas, so no single spec may hold
         # one -- ranges only, never lists or `auto` combined with a range.
         f"--network=pasta:-T,{port_span(TO_HOST_PORTS)},"
-        f"-t,127.0.0.1/{inbound_host}:{port_span(INBOUND_PORTS)}",
-        "--annotation", f"krun.ram_mib={VM_RAM_MIB}",
+        # No ":to" part, so each host port lands on the same port inside.
+        f"-t,127.0.0.1/{inbound}",
     ]
+    if vm:
+        args += ["--annotation", f"krun.ram_mib={ram_mib}"]
+        if cpus is not None:
+            args += ["--annotation", f"krun.cpus={cpus}"]
     if not relabel:
         args += ["--security-opt", "label=disable"]
     args += [
         "-v", mount_spec(str(config_src), agent.config_path, suffix),
         "-v", mount_spec(str(project), dest, suffix),
         "-w", dest,
-        # Podman derives HOME from --user, which would make it /root.
+        # Podman derives HOME from --user, which would make it /root in a VM.
         "-e", f"HOME={CONTAINER_HOME}",
         "-e", f"SANDBX_AGENT={name}",
-        # Where the agent's INBOUND_PORTS show up on the host, so it can say so.
-        "-e", f"SANDBX_HOST_PORTS={inbound_host}",
+        # So the agent, and whoever is in the shell, can tell a VM from a container.
+        "-e", f"SANDBX_RUNTIME={runtime}",
+        # The ports to serve on for the host to see them, so the agent can say so.
+        "-e", f"SANDBX_HOST_PORTS={inbound}",
         "-e", f"ANDROID_ADB_SERVER_PORT={ADB_SERVER_PORT}",
     ]
     for key, value in agent.env.items():
         args += ["-e", f"{key}={value}"]
     args.append(agent.image)
-    args += list(AS_AGENT)
+    if vm:
+        args += list(AS_AGENT)
     if shell:
         args += list(SHELL_COMMAND)
     else:
@@ -479,9 +548,29 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
                         help=f"open a bash shell in the sandbox instead of starting "
                              f"{name}; run `{shlex.join(AGENTS[name].command)}` "
                              f"from it when ready")
+    parser.add_argument("--runtime", choices=RUNTIMES, default=VM_RUNTIME,
+                        help=f"{VM_RUNTIME}: a microVM with its own kernel (default); "
+                             f"{CONTAINER_RUNTIME}: a plain container on the host "
+                             f"kernel, no KVM needed")
+    # Every option in this group is refused under any other runtime, so each
+    # must default to None: that is how an explicit one is told apart.
+    vm = parser.add_argument_group(f"microVM options (--runtime {VM_RUNTIME} only)")
+    vm_only = [
+        vm.add_argument("--ram", type=parse_ram, metavar="SIZE",
+                        help=f"VM memory: MiB, or with a G or M suffix "
+                             f"(default: {VM_RAM_MIB // 1024}G)"),
+        vm.add_argument("--cpus", type=int, metavar="N",
+                        help=f"VM vCPUs, 1-{VM_MAX_CPUS} (default: every CPU "
+                             f"sandbx may run on, up to {VM_MAX_CPUS})"),
+    ]
     opts = parser.parse_args(ours)
     if opts.shell and passthrough:
         parser.error("--shell cannot be combined with -- ARGS")
+    if opts.runtime != VM_RUNTIME:
+        for action in vm_only:
+            if getattr(opts, action.dest) is not None:
+                parser.error(f"{action.option_strings[-1]} needs --runtime "
+                             f"{VM_RUNTIME}; a {opts.runtime} sandbox is not a VM")
 
     project = resolve_project(opts.path)
     agents_root = state_root()
@@ -497,6 +586,9 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
         extra=passthrough,
         shell=opts.shell,
         host_block=host_block,
+        runtime=opts.runtime,
+        ram_mib=opts.ram,
+        cpus=opts.cpus,
     )
 
     if opts.dry_run:
@@ -505,17 +597,18 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
 
     if shutil.which("podman") is None:
         raise SandboxError("podman not found on PATH")
-    if not have_kvm():
+    if opts.runtime == VM_RUNTIME and not have_kvm():
         raise SandboxError(
-            "cannot open /dev/kvm; every sandbox is a microVM and needs KVM. "
-            "Check that virtualization is enabled and /dev/kvm is read-write for you"
+            f"cannot open /dev/kvm; a {VM_RUNTIME} sandbox is a microVM and needs "
+            "KVM. Check that virtualization is enabled and /dev/kvm is read-write "
+            f"for you, or use --runtime {CONTAINER_RUNTIME} for a plain container"
         )
 
     # Bind mounts get no copy-up, so podman would create this root-owned. Do it
     # after the checks above so a failed launch leaves no stray state behind.
     (agents_root / AGENTS[name].state_dir).mkdir(parents=True, exist_ok=True)
-    print(f"sandbx: host 127.0.0.1:{port_span(host_ports(host_block))} -> "
-          f"sandbox :{port_span(INBOUND_PORTS)}", file=sys.stderr)
+    print(f"sandbx: ports {port_span(block_ports(host_block))} inside reach the "
+          "same ports on host 127.0.0.1", file=sys.stderr)
     if opts.shell:
         print(f"sandbx: {name} not started; run "
               f"`{shlex.join(AGENTS[name].command)}` to launch it", file=sys.stderr)
