@@ -13,6 +13,7 @@ credentials because agents/copilot/ is simply absent from its mount table.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -193,6 +194,82 @@ def state_root(env: Mapping[str, str] | None = None) -> Path:
     return (base / "sandbx" / "agents").resolve()
 
 
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+
+_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def profiles_path(env: Mapping[str, str] | None = None) -> Path:
+    """The profiles.json file, sibling to the agents directory."""
+    return state_root(env).parent / "profiles.json"
+
+
+def load_profiles(env: Mapping[str, str] | None = None) -> dict:
+    """Read profiles.json; return the implicit default when the file is absent."""
+    path = profiles_path(env)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SandboxError(f"cannot read {path}: {exc}") from None
+        if not isinstance(data.get("profiles"), list) or not data["profiles"]:
+            raise SandboxError(
+                f"malformed {path}: 'profiles' must be a non-empty list"
+            )
+        if data.get("active") not in data["profiles"]:
+            raise SandboxError(
+                f"malformed {path}: active profile {data.get('active')!r} "
+                f"is not in the profiles list"
+            )
+        data.setdefault("agent_active", {})
+        for agent, profile in data["agent_active"].items():
+            if profile not in data["profiles"]:
+                raise SandboxError(
+                    f"malformed {path}: agent_active[{agent!r}] = {profile!r} "
+                    f"is not in the profiles list"
+                )
+        return data
+    return {"profiles": ["default"], "active": "default", "agent_active": {}}
+
+
+def save_profiles(data: dict, env: Mapping[str, str] | None = None) -> None:
+    """Write profiles.json atomically."""
+    path = profiles_path(env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def validate_profile_name(name: str) -> None:
+    if not _PROFILE_NAME.match(name):
+        raise SandboxError(
+            f"invalid profile name {name!r}: must start with a letter or digit, "
+            "contain only letters, digits, '.', '_', '-', and be 1-64 characters"
+        )
+
+
+def active_profile(agent: str | None = None,
+                   env: Mapping[str, str] | None = None) -> str:
+    """The profile used when --profile is not given.
+
+    If *agent* is given and has a per-agent override in agent_active, that
+    wins; otherwise the global active profile is returned.
+    """
+    data = load_profiles(env)
+    if agent and agent in data.get("agent_active", {}):
+        return data["agent_active"][agent]
+    return data["active"]
+
+def assert_path_within(target: Path, expected_parent: Path,
+                       root: Path) -> None:
+    """Raise if *target* is not a direct child of *expected_parent* or escapes *root*."""
+    if target.parent != expected_parent or not target.resolve().is_relative_to(root):
+        raise SandboxError(f"refusing to delete {target}: unexpected path")
+
+
 def validate_project(project: Path, home: Path, agents_root: Path) -> None:
     """Reject project paths that would defeat the point of the sandbox.
 
@@ -367,6 +444,8 @@ def parse_ram(value: str) -> int:
             f"invalid size {value!r}; give MiB (8192) or a G or M suffix (8G)"
         )
     amount = int(match[1])
+    if amount == 0:
+        raise argparse.ArgumentTypeError("RAM size must be greater than zero")
     return amount * 1024 if match[2].upper() == "G" else amount
 
 
@@ -375,6 +454,7 @@ def build_podman_args(
     project: Path,
     *,
     agents_root: Path,
+    profile: str = "default",
     relabel: bool = True,
     interactive: bool = True,
     extra: Sequence[str] = (),
@@ -437,7 +517,8 @@ def build_podman_args(
         )
     inbound = port_span(block_ports(host_block))
 
-    config_src = agents_root / agent.state_dir
+    validate_profile_name(profile)
+    config_src = agents_root / agent.state_dir / profile
     # ":z" (shared), not ":Z" (private). Containers here are ephemeral and get a
     # fresh MCS category per run, so ":Z" would relabel the whole project tree on
     # every single launch. Side effect: the project dir becomes container_file_t
@@ -493,6 +574,7 @@ def build_podman_args(
         # Podman derives HOME from --user, which would make it /root in a VM.
         "-e", f"HOME={CONTAINER_HOME}",
         "-e", f"SANDBX_AGENT={name}",
+        "-e", f"SANDBX_PROFILE={profile}",
         # So the agent, and whoever is in the shell, can tell a VM from a container.
         "-e", f"SANDBX_RUNTIME={runtime}",
         # The ports to serve on for the host to see them, so the agent can say so.
@@ -544,6 +626,8 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
                         help="skip SELinux :z relabeling; disable label confinement instead")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the podman command without running it")
+    parser.add_argument("-p", "--profile", default=None,
+                        help="credential profile to use (default: the active profile)")
     parser.add_argument("-s", "--shell", action="store_true",
                         help=f"open a bash shell in the sandbox instead of starting "
                              f"{name}; run `{shlex.join(AGENTS[name].command)}` "
@@ -572,6 +656,9 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
                 parser.error(f"{action.option_strings[-1]} needs --runtime "
                              f"{VM_RUNTIME}; a {opts.runtime} sandbox is not a VM")
 
+    profile = opts.profile or active_profile(agent=name)
+    validate_profile_name(profile)
+
     project = resolve_project(opts.path)
     agents_root = state_root()
     validate_project(project, home_dir(), agents_root)
@@ -581,6 +668,7 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
     args = build_podman_args(
         name, project,
         agents_root=agents_root,
+        profile=profile,
         relabel=not opts.no_relabel,
         interactive=sys.stdin.isatty(),
         extra=passthrough,
@@ -606,13 +694,17 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
 
     # Bind mounts get no copy-up, so podman would create this root-owned. Do it
     # after the checks above so a failed launch leaves no stray state behind.
-    (agents_root / AGENTS[name].state_dir).mkdir(parents=True, exist_ok=True)
-    print(f"sandbx: ports {port_span(block_ports(host_block))} inside reach the "
-          "same ports on host 127.0.0.1", file=sys.stderr)
+    (agents_root / AGENTS[name].state_dir / profile).mkdir(
+        parents=True, exist_ok=True)
+    print(f"sandbx: profile={profile}, ports {port_span(block_ports(host_block))} "
+          "inside reach the same ports on host 127.0.0.1", file=sys.stderr)
     if opts.shell:
         print(f"sandbx: {name} not started; run "
               f"`{shlex.join(AGENTS[name].command)}` to launch it", file=sys.stderr)
-    os.execvp("podman", args)  # replaces this process; keeps the TTY clean
+    try:
+        os.execvp("podman", args)  # replaces this process; keeps the TTY clean
+    except OSError as exc:
+        raise SandboxError(f"failed to exec podman: {exc}") from exc
 
 
 def cmd_build(argv: Sequence[str]) -> int:
@@ -645,7 +737,7 @@ def cmd_build(argv: Sequence[str]) -> int:
         # --pull only concerns the registry base (ubuntu:24.04), which the agent
         # images do not reference; passing it here would be a no-op at best.
         _build_image(AGENTS[name].image, IMAGES_DIR / f"Containerfile.{name}",
-                     no_cache=opts.no_cache)
+                     no_cache=True)
     return 0
 
 
@@ -688,13 +780,21 @@ def cmd_list(argv: Sequence[str]) -> int:
     argparse.ArgumentParser(prog="sandbx list").parse_args(list(argv))
     agents_root = state_root()
     have_podman = shutil.which("podman") is not None
-    print(f"{'AGENT':<10} {'IMAGE':<22} {'BUILT':<7} STATE")
+    data = load_profiles()
+    print(f"active profile: {data['active']}")
+    print(f"{'AGENT':<10} {'IMAGE':<22} {'BUILT':<7} PROFILES")
     for name in sorted(AGENTS):
         agent = AGENTS[name]
         built = "yes" if image_exists(agent.image) else "no" if have_podman else "?"
-        state = agents_root / agent.state_dir
-        marker = str(state) if state.exists() else f"{state} (empty)"
-        print(f"{name:<10} {agent.image:<22} {built:<7} {marker}")
+        agent_dir = agents_root / agent.state_dir
+        if agent_dir.exists():
+            existing = sorted(
+                p.name for p in agent_dir.iterdir() if p.is_dir()
+            )
+            profiles_str = ", ".join(existing) if existing else "(empty)"
+        else:
+            profiles_str = "(no state)"
+        print(f"{name:<10} {agent.image:<22} {built:<7} {profiles_str}")
     return 0
 
 
@@ -704,25 +804,39 @@ def cmd_reset(argv: Sequence[str]) -> int:
         description="Delete an agent's persistent state, including its credentials.",
     )
     parser.add_argument("agent", choices=sorted(AGENTS))
+    parser.add_argument("-p", "--profile", default=None,
+                        help="profile to reset (default: active profile)")
+    parser.add_argument("--all-profiles", action="store_true",
+                        help="reset all profiles for this agent")
     parser.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
     opts = parser.parse_args(list(argv))
 
+    if opts.profile and opts.all_profiles:
+        parser.error("--profile and --all-profiles are mutually exclusive")
+
     root = state_root()
-    target = root / AGENTS[opts.agent].state_dir
-    # validate_registry() has already vetted state_dir, but this one deletes
-    # things: confirm independently that the path really is inside the state
-    # root before handing it to rmtree.
-    if target.parent != root or not target.resolve().is_relative_to(root):
-        raise SandboxError(
-            f"refusing to delete {target}: not a direct child of {root}"
-        )
+    agent_dir = root / AGENTS[opts.agent].state_dir
+
+    if opts.all_profiles:
+        target = agent_dir
+        assert_path_within(target, root, root)
+        desc = f"all profiles for {opts.agent}"
+        confirm_text = opts.agent
+    else:
+        profile = opts.profile or active_profile(agent=opts.agent)
+        validate_profile_name(profile)
+        target = agent_dir / profile
+        assert_path_within(target, agent_dir, root)
+        desc = f"{opts.agent} profile {profile!r}"
+        confirm_text = f"{opts.agent}/{profile}"
+
     if not target.exists():
         print(f"nothing to reset: {target} does not exist")
         return 0
     if not opts.yes:
-        print(f"This deletes {target}, including {opts.agent}'s stored credentials")
+        print(f"This deletes {target}, including {desc}'s stored credentials")
         print("and session history. This cannot be undone.")
-        if input("Type the agent name to confirm: ").strip() != opts.agent:
+        if input(f"Type '{confirm_text}' to confirm: ").strip() != confirm_text:
             print("aborted")
             return 1
     shutil.rmtree(target)
@@ -730,12 +844,160 @@ def cmd_reset(argv: Sequence[str]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# sandbx profile
+# ---------------------------------------------------------------------------
+
+def cmd_profile(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="sandbx profile",
+        description="Manage credential profiles.",
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    sub.add_parser("list", help="list profiles and which is active")
+
+    p_create = sub.add_parser("create", help="create a new profile")
+    p_create.add_argument("name", help="profile name to create")
+
+    p_rename = sub.add_parser("rename", help="rename a profile")
+    p_rename.add_argument("old", help="current name")
+    p_rename.add_argument("new", help="new name")
+
+    p_delete = sub.add_parser("delete", help="delete a profile and all its state")
+    p_delete.add_argument("name", help="profile to delete")
+    p_delete.add_argument("-y", "--yes", action="store_true",
+                          help="skip confirmation")
+
+    p_set = sub.add_parser("set", help="set the active (default) profile")
+    p_set.add_argument("name", help="profile to make active")
+    p_set.add_argument("--agent", choices=sorted(AGENTS), default=None,
+                       help="set this agent's default instead of the global one")
+
+    opts = parser.parse_args(list(argv))
+
+    dispatch = {
+        "list":   lambda: _profile_list(),
+        "create": lambda: _profile_create(opts.name),
+        "rename": lambda: _profile_rename(opts.old, opts.new),
+        "delete": lambda: _profile_delete(opts.name, yes=opts.yes),
+        "set":    lambda: _profile_set(opts.name, agent=opts.agent),
+    }
+    return dispatch[opts.action]()
+
+
+def _profile_list() -> int:
+    data = load_profiles()
+    for name in data["profiles"]:
+        marker = " (active)" if name == data["active"] else ""
+        print(f"  {name}{marker}")
+    overrides = data.get("agent_active", {})
+    if overrides:
+        print()
+        for agent in sorted(overrides):
+            print(f"  {agent}: {overrides[agent]}")
+    return 0
+
+
+def _profile_create(name: str) -> int:
+    validate_profile_name(name)
+    data = load_profiles()
+    if name in data["profiles"]:
+        raise SandboxError(f"profile {name!r} already exists")
+    data["profiles"].append(name)
+    save_profiles(data)
+    print(f"created profile {name!r}")
+    return 0
+
+
+def _profile_rename(old: str, new: str) -> int:
+    validate_profile_name(old)
+    validate_profile_name(new)
+    data = load_profiles()
+    if old not in data["profiles"]:
+        raise SandboxError(f"no such profile {old!r}")
+    if new in data["profiles"]:
+        raise SandboxError(f"profile {new!r} already exists")
+    root = state_root()
+    pairs: list[tuple[Path, Path]] = []
+    for agent_name, agent in AGENTS.items():
+        src = root / agent.state_dir / old
+        dst = root / agent.state_dir / new
+        if src.exists():
+            if dst.exists():
+                raise SandboxError(
+                    f"cannot rename: {dst} already exists for {agent_name}"
+                )
+            pairs.append((src, dst))
+    for src, dst in pairs:
+        src.rename(dst)
+    idx = data["profiles"].index(old)
+    data["profiles"][idx] = new
+    if data["active"] == old:
+        data["active"] = new
+    for agent, profile in list(data.get("agent_active", {}).items()):
+        if profile == old:
+            data["agent_active"][agent] = new
+    save_profiles(data)
+    print(f"renamed profile {old!r} -> {new!r}")
+    return 0
+
+
+def _profile_delete(name: str, *, yes: bool = False) -> int:
+    data = load_profiles()
+    if name not in data["profiles"]:
+        raise SandboxError(f"no such profile {name!r}")
+    if name == data["active"]:
+        raise SandboxError(
+            f"cannot delete the active profile {name!r}; "
+            "switch to another first with `sandbx profile set <name>`"
+        )
+    if len(data["profiles"]) <= 1:
+        raise SandboxError("cannot delete the only profile")
+    if not yes:
+        print(f"This deletes all state for profile {name!r} across every agent.")
+        print("This cannot be undone.")
+        if input("Type the profile name to confirm: ").strip() != name:
+            print("aborted")
+            return 1
+    data["profiles"].remove(name)
+    for agent in [a for a, p in data.get("agent_active", {}).items() if p == name]:
+        del data["agent_active"][agent]
+    save_profiles(data)
+    root = state_root()
+    for agent_name, agent in AGENTS.items():
+        target = root / agent.state_dir / name
+        assert_path_within(target, root / agent.state_dir, root)
+        if target.exists():
+            shutil.rmtree(target)
+            print(f"  removed {target}")
+    print(f"deleted profile {name!r}")
+    return 0
+
+
+def _profile_set(name: str, *, agent: str | None = None) -> int:
+    data = load_profiles()
+    if name not in data["profiles"]:
+        raise SandboxError(f"no such profile {name!r}")
+    if agent:
+        data.setdefault("agent_active", {})[agent] = name
+        save_profiles(data)
+        print(f"{agent} active profile: {name}")
+    else:
+        data["active"] = name
+        save_profiles(data)
+        print(f"active profile: {name}")
+    return 0
+
+
 USAGE = f"""usage: sandbx <agent> [path] [options]
        sandbx build [agent|--all]
        sandbx list
-       sandbx reset <agent>
+       sandbx reset <agent> [-p PROFILE|--all-profiles]
+       sandbx profile create|list|rename|delete|set
 
 agents: {', '.join(sorted(AGENTS))}
+profiles: run `sandbx profile list` to see profiles.
 
 Run `sandbx <agent> --help` for per-agent options.
 """
@@ -752,7 +1014,8 @@ def main(argv: Sequence[str]) -> int:
     command, rest = argv[0], argv[1:]
     if command in AGENTS:
         return cmd_run(command, rest)
-    dispatch = {"build": cmd_build, "list": cmd_list, "reset": cmd_reset}
+    dispatch = {"build": cmd_build, "list": cmd_list, "reset": cmd_reset,
+                "profile": cmd_profile}
     if command in dispatch:
         return dispatch[command](rest)
 
