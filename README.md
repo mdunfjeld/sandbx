@@ -1,168 +1,118 @@
 # sandbx
 
-Run an AI coding agent in a disposable libkrun microVM, launched through podman,
-where the only access to the host filesystem is the selected project directory
-and that agent's own credentials — nothing else. `--runtime crun` runs a plain
-podman container instead, for hosts without KVM.
+Run AI coding agents in disposable libkrun microVMs via podman. Each agent sees
+only the project directory and its own credentials — nothing else.
+`--runtime crun` runs a plain container instead, for hosts without KVM.
 
 ```sh
-./install.sh                   # symlink sandbx into ~/.local/bin
-sandbx build                   # build all images (once)
-sandbx claude ~/project        # launch
+./install.sh              # symlink into ~/.local/bin
+sandbx build              # build all images (once)
+sandbx claude ~/project   # launch
 ```
 
-The VM is deleted on exit; the agent's config and session history persist.
-Several sandboxes can run at once.
+The VM is deleted on exit; credentials and session history persist via bind mounts.
+Several sandboxes run at once.
 
 ## Requirements
 
-- podman with the `krun` runtime: `sudo dnf install crun-krun` on Fedora.
-- `/dev/kvm`, readable and writable by you. sandbx checks before launching.
+- podman with `krun`: `sudo dnf install crun-krun` on Fedora
+- `/dev/kvm` readable and writable by you
 
 `--runtime crun` needs neither, only podman.
 
 ## Commands
 
 ```
-sandbx <agent> [path]              # path defaults to cwd
-sandbx <agent> [path] -- ARGS...   # pass ARGS to the agent
-sandbx <agent> [path] -s|--shell   # bash in the sandbox; start the agent yourself
-sandbx <agent> --dry-run           # print the podman command, run nothing
-sandbx <agent> --no-relabel        # skip SELinux :z relabeling
-sandbx <agent> --ram 8G --cpus 4   # size the VM, krun only (see VM size under Details)
-sandbx <agent> --runtime crun      # plain container, no VM (see Runtime under Details)
-sandbx build [agent]               # all agents; base only if missing
-sandbx build --base                # rebuild the base image too
-sandbx build --no-cache            # reinstall the agent CLIs (see Updating)
-sandbx list
-sandbx reset <agent> [-y]          # delete that agent's state and credentials
+sandbx <agent> [path]              run agent (path defaults to cwd)
+sandbx <agent> [path] -- ARGS      pass ARGS to the agent
+sandbx <agent> [path] -s|--shell   bash in the sandbox, start agent yourself
+sandbx <agent> --dry-run           print the podman command, run nothing
+sandbx <agent> --no-relabel        skip SELinux :z relabeling
+sandbx <agent> --ram 8G --cpus 4   size the VM (krun only)
+sandbx <agent> --runtime crun      plain container, no VM
+sandbx <agent> -p work             run with a named profile
+
+sandbx build [agent]               build images (base only if missing)
+sandbx build --base --no-cache     rebuild base + agents from scratch
+sandbx list                        show agents, images, profiles
+sandbx reset <agent> [-y]          delete active profile's state
+sandbx reset <agent> --all-profiles
+
+sandbx profile list
+sandbx profile create <name>
+sandbx profile rename <old> <new>
+sandbx profile delete <name> [-y]
+sandbx profile set <name>          set the global default profile
+sandbx profile set <name> --agent claude   per-agent default
 ```
 
-Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe` (Mistral Vibe).
+Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe`.
 
-## Guarantees
+## Profiles
 
-| | How |
+Profiles let you maintain separate login sessions per agent — e.g. personal
+and work credentials.
+
+```
+~/.local/share/sandbx/
+  profiles.json
+  agents/
+    claude/
+      default/    # mounted when profile=default
+      work/       # mounted when profile=work
+    codex/
+      default/
+```
+
+A `default` profile is created automatically. Use `sandbx profile set work
+--agent claude` so `sandbx claude .` always uses the work profile without
+`-p work`.
+
+## Isolation guarantees
+
+| Guarantee | Mechanism |
 | --- | --- |
-| No host access beyond the project | Exactly two bind mounts: the project and that agent's state dir |
-| Agents can't read each other's credentials | Other agents' state dirs are not mounted at all |
-| Sandbox is disposable, data survives | `--rm`, bind mounts only |
-| A kernel exploit stays in the guest | Each sandbox is a libkrun microVM (`--runtime=krun`) with its own kernel. Not with `--runtime crun` |
-| Host network only through reserved ports | pasta forwards the ranges under [Ports](#ports), nothing else |
+| No host access beyond the project | Exactly two bind mounts: project + agent state |
+| Agents can't read each other's credentials | Only the running agent's state dir is mounted |
+| Sandbox is disposable, data survives | `--rm` container, bind mounts persist |
+| Kernel exploit stays in guest | libkrun microVM with its own kernel (not with `--runtime crun`) |
+| Host network only through reserved ports | pasta forwards specific ranges, nothing else |
 
-The agent still reaches the internet and your LAN. It doesn't reach host
-localhost services outside the reserved ports, or the host's abstract unix
-sockets (X11 and similar). The project mount stays read-write, so review what
-the agent leaves there (git hooks, `.envrc`, task files) before running it on
-the host.
+The agent still reaches the internet and your LAN. Review what it leaves in the
+project (git hooks, `.envrc`, task files) before running on the host.
 
 ## Ports
 
-| Host ports | Direction | Use |
+| Host ports | Direction | Purpose |
 | --- | --- | --- |
-| 30000–30009 | sandbox → host, shared by all sandboxes | 30000 adb server, 30001 Burp proxy, 30002 Burp MCP, 30003–30009 as needed |
-| 30010–30099 | host → sandbox, host `127.0.0.1` only | One block of 10 per sandbox, same port numbers inside and on the host |
+| 30000–30009 | sandbox → host (shared) | adb 30000, Burp proxy 30001, Burp MCP 30002, 30003–30009 free |
+| 30010–30099 | host → sandbox (`127.0.0.1`) | One block of 10 per sandbox, same port inside and out |
 
-**Sandbox → host:** inside the VM, `127.0.0.1:30000`–`30009` reach the same
-ports on the host's localhost. Point host services there:
+Inside the VM, `127.0.0.1:30000`–`30009` reach the host's localhost. Each
+sandbox claims the first free 10-port block from 30010–30099 and prints it;
+`$SANDBX_HOST_PORTS` has the range. A server on those ports appears on the
+host's `127.0.0.1` at the same numbers.
 
-```sh
-export ANDROID_ADB_SERVER_PORT=30000   # host shell rc; every host adb must use it
-adb start-server
-```
+## Updating
 
-In Burp, add proxy listeners on `127.0.0.1:30001` (and `30002` for the MCP
-server) next to whatever your phone uses. sandbx sets `ANDROID_ADB_SERVER_PORT`
-inside, so `adb devices` there talks to the host server. The client and server
-versions must match, or the client kills your host server. `adb forward` opens
-its listener on the host, so forward to a port in this range, e.g.
-`adb forward tcp:30003 tcp:27042` then `frida -H 127.0.0.1:30003`.
-
-**Host → sandbox:** each sandbox takes the first free block of 30010–30099 on
-launch (up to nine at once), prints it, and exposes it inside as
-`$SANDBX_HOST_PORTS`. A server the agent starts on one of those ports appears
-on the same port of the host's `127.0.0.1`: the second sandbox serves on
-30020–30029, and you open 30020–30029. The ranges must be free on the host:
-`ss -tln '( sport >= :30000 and sport <= :30099 )'`.
-
-## State and logins
-
-```
-~/.local/share/sandbx/agents/
-├── claude/    -> /home/agent/.claude    (CLAUDE_CONFIG_DIR)
-├── codex/     -> /home/agent/.codex     (CODEX_HOME)
-├── copilot/   -> /home/agent/.copilot   (COPILOT_HOME)
-├── opencode/  -> /home/agent/.opencode  (XDG_{CONFIG,DATA,STATE,CACHE}_HOME)
-└── vibe/      -> /home/agent/.vibe      (VIBE_HOME)
-```
-
-## Project path inside the container
-
-The project is mounted at `/workspace/<name>`, where `<name>` is its basename
-(unsafe characters become `-`). This is readable, hides your host layout, and
-survives moving the project.
-
-## Details
-
-- **Runtime:** `krun` by default: a microVM with its own kernel. `--runtime crun`
-  is podman's usual runtime: a namespaced container on the host kernel, so a
-  kernel exploit reaches the host. Use it where there's no KVM. Mounts, network
-  and env are the same in both. `$SANDBX_RUNTIME` says which one you're in.
-  The VM options (`--ram`, `--cpus`) are refused under crun, not ignored.
-- **Refused paths:** `/`, `$HOME`, anything containing or inside the state dir,
-  and any path with `:` (podman's `-v` can't escape it). Symlinks are resolved first.
-- **SELinux:** mounts use `:z`, which relabels the project to `container_file_t`
-  on the host. `:Z` would relabel on every launch. `--no-relabel` disables label
-  confinement instead.
-- **Container user:** `agent`, uid 1000, via `--userns=keep-id:uid=1000,gid=1000`,
-  so files come out owned by you. Passwordless `sudo`; installs vanish on exit.
-  The VM itself starts as root in the user namespace (`--user 0:0`), because
-  krun's VMM opens every file for the guest and as `agent` it can't open
-  root-owned ones, which breaks `sudo`. `setpriv` drops the agent (or the
-  `--shell` shell) to `agent` before it starts. crun has no VMM in the way, so
-  it starts as `agent` directly (`--user 1000:1000`).
-- **VM size (krun only):** 4 GiB RAM per sandbox (libkrun's default is 1 GiB), committed
-  only as used. vCPUs default to every CPU sandbx may run on, up to 16.
-  `--ram` (`8G`, `512M`, or plain MiB) and `--cpus` override them per launch.
-  RAM must be over 128 MiB, because crun quietly swaps anything smaller for
-  1 GiB. vCPUs go from 1 to 16, libkrun's hard limit.
-- **Shell first:** `--shell` builds the identical sandbox (same mounts and env)
-  but runs `bash -l` instead of the agent. Set things up, then run `claude` (etc.)
-  by hand in the same container; it all goes away when the shell exits. Can't
-  be combined with `-- ARGS` — pass those on the agent's own command line.
-
-
-## Updating an agent
-
-The CLIs live in the image, not in a mount, so an in-container `npm update -g`
-or self-update is discarded on exit. Rebuilding alone isn't enough either: each
-install is one `RUN` layer, so podman reuses the cached one and the version
-never moves. `--no-cache` is what forces the reinstall:
+Agent CLIs live in the image. Rebuilding alone reuses the cached layer — use
+`--no-cache` to force a reinstall:
 
 ```sh
-sandbx build claude --no-cache                 # one agent
-sandbx build --no-cache                        # all agents
-podman run --rm sandbx-claude claude --version # confirm
+sandbx build claude --no-cache          # one agent
+sandbx build --no-cache                 # all agents
+sandbx build --base --no-cache --pull   # also rebuild base + ubuntu:26.04
 ```
 
-The base image is left alone unless it's missing, since it changes rarely and
-takes minutes. Rebuild it deliberately:
-
-```sh
-sandbx build --base --no-cache --pull          # base (+ ubuntu:24.04) and agents
-```
-
-`--pull` only affects the base; agent images build `FROM sandbx-base`. `--no-base`
-skips the base even when it's missing. Old layers stay on disk — `podman image
-prune` reclaims the space.
+`--pull` only affects the base image. Old layers stay on disk — `podman image
+prune` reclaims space.
 
 ## Install / uninstall
 
-`install.sh` symlinks rather than copies, so keep this directory in place (re-run
-it if you move it). It won't overwrite an unrelated `sandbx` without `--force`.
+`install.sh` symlinks into `~/.local/bin` (re-run if you move the repo).
 
 ```sh
 ./install.sh --prefix /usr/local/bin
-./uninstall.sh                     # remove the symlink only
-./uninstall.sh --purge --images    # also delete all state and images
+./uninstall.sh                          # remove the symlink
+./uninstall.sh --purge --images         # also delete state and images
 ```
