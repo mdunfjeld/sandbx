@@ -33,7 +33,7 @@ sandbx <agent> --runtime crun      plain container, no VM
 sandbx <agent> -p work             run with a named profile
 
 sandbx build [agent]               build images (base only if missing)
-sandbx build --base --no-cache     rebuild base + agents from scratch
+sandbx build --base --no-cache     rebuild base from scratch
 sandbx list                        show agents, images, profiles
 sandbx reset <agent> [-y]          delete active profile's state
 sandbx reset <agent> --all-profiles
@@ -95,17 +95,17 @@ host's `127.0.0.1` at the same numbers.
 
 ## Updating
 
-Agent CLIs live in the image. Rebuilding alone reuses the cached layer — use
-`--no-cache` to force a reinstall:
+Agent images always skip the build cache, so a plain rebuild pulls the latest
+CLI version:
 
 ```sh
-sandbx build claude --no-cache          # one agent
-sandbx build --no-cache                 # all agents
+sandbx build claude                     # rebuild one agent
+sandbx build                            # rebuild all agents
 sandbx build --base --no-cache --pull   # also rebuild base + ubuntu:26.04
 ```
 
-`--pull` only affects the base image. Old layers stay on disk — `podman image
-prune` reclaims space.
+`--no-cache` and `--pull` only affect the base image. Old layers stay on
+disk — `podman image prune` reclaims space.
 
 ## Install / uninstall
 
