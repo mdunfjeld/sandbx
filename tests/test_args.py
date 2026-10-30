@@ -386,18 +386,21 @@ class TestFlags(unittest.TestCase):
 
 
 class CliRunner:
-    def run_cli(self, name, args, *, real=False, kvm=True):
+    def run_cli(self, name, args, *, real=False, kvm=True, profiles=None):
         """cmd_run against a temp project and state root; returns (rc, out, err).
 
         real=True goes past --dry-run with podman and execvp faked out. The
         host-facing probes are faked either way: the port block is always the
-        first, and kvm decides whether /dev/kvm looks usable.
+        first, and kvm decides whether /dev/kvm looks usable. profiles, if
+        given, is the "agents" mapping written to profiles.json first.
         """
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "proj"
             project.mkdir()
             env = {"HOME": str(Path(tmp) / "home"),
                    "XDG_DATA_HOME": str(Path(tmp) / "data")}
+            if profiles is not None:
+                sandbx.save_profiles({"version": 2, "agents": profiles}, env)
             out, err = io.StringIO(), io.StringIO()
             with contextlib.ExitStack() as stack:
                 stack.enter_context(unittest.mock.patch.dict(sandbx.os.environ, env))
@@ -1193,23 +1196,90 @@ class ProfileTmpDir:
     def profiles_json(self):
         return sandbx.profiles_path(self.env)
 
+    def save(self, **agents):
+        """Write a v2 profiles.json; each keyword is agent=(profiles, active)."""
+        sandbx.save_profiles({"version": 2, "agents": {
+            agent: {"profiles": list(profiles), "active": active}
+            for agent, (profiles, active) in agents.items()}}, self.env)
+
+    def entry(self, agent):
+        return sandbx.agent_entry(sandbx.load_profiles(self.env), agent)
+
+    def state(self, agent, profile):
+        """Create a profile state dir holding a fake credential; return it."""
+        d = self.agents_root / AGENTS[agent].state_dir / profile
+        d.mkdir(parents=True)
+        (d / "creds.json").write_text("{}")
+        return d
+
+    def _call(self, func, args):
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
+             contextlib.redirect_stdout(out), \
+             contextlib.redirect_stderr(err):
+            rc = func(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def run_profile(self, *args):
+        return self._call(sandbx.cmd_profile, args)
+
+    def run_reset(self, *args):
+        return self._call(sandbx.cmd_reset, args)
+
 
 class TestProfilesJson(ProfileTmpDir, unittest.TestCase):
-    def test_absent_file_returns_default(self):
+    def test_absent_file_gives_every_agent_the_default(self):
         data = sandbx.load_profiles(self.env)
-        self.assertEqual(data, {"profiles": ["default"], "active": "default",
-                                "agent_active": {}})
+        for name in AGENTS:
+            with self.subTest(agent=name):
+                self.assertEqual(sandbx.agent_entry(data, name),
+                                 {"profiles": ["default"], "active": "default"})
+                self.assertEqual(sandbx.active_profile(name, self.env), "default")
+
+    def test_absent_file_finds_profiles_left_on_disk(self):
+        """Before profiles.json existed, -p could name any profile."""
+        self.state("claude", "work")
+        (self.agents_root / "claude" / ".cache").mkdir()
+        self.assertEqual(self.entry("claude"),
+                         {"profiles": ["default", "work"], "active": "default"})
+        self.assertEqual(self.entry("codex"),
+                         {"profiles": ["default"], "active": "default"})
+        self.assertFalse(self.profiles_json().exists())
 
     def test_roundtrip(self):
-        data = {"profiles": ["default", "work"], "active": "work",
-                "agent_active": {}}
-        sandbx.save_profiles(data, self.env)
-        self.assertEqual(sandbx.load_profiles(self.env), data)
+        self.save(claude=(["default", "work"], "work"))
+        self.assertEqual(self.entry("claude"),
+                         {"profiles": ["default", "work"], "active": "work"})
 
     def test_atomic_write(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"}, self.env)
-        self.assertTrue(self.profiles_json().exists())
-        self.assertFalse(self.profiles_json().with_suffix(".tmp").exists())
+        self.save(claude=(["default"], "default"))
+        self.assertEqual([p.name for p in self.profiles_json().parent.iterdir()],
+                         ["profiles.json"])
+
+    def test_overlapping_saves_both_succeed(self):
+        """Another sandbx may save between this one's write and its rename;
+        each needs its own temp file to rename."""
+        real_replace = sandbx.os.replace
+        nested = []
+
+        def replace(src, dst):
+            if not nested:
+                nested.append(True)
+                self.save(codex=(["default"], "default"))
+            real_replace(src, dst)
+
+        with unittest.mock.patch.object(sandbx.os, "replace", replace):
+            self.save(claude=(["default", "work"], "work"))
+        self.assertEqual(self.entry("claude")["profiles"], ["default", "work"])
+        self.assertEqual([p.name for p in self.profiles_json().parent.iterdir()],
+                         ["profiles.json"])
+
+    def test_each_agent_has_its_own_active_profile(self):
+        self.save(claude=(["default", "work"], "work"),
+                  copilot=(["private", "default"], "private"))
+        self.assertEqual(sandbx.active_profile("claude", self.env), "work")
+        self.assertEqual(sandbx.active_profile("copilot", self.env), "private")
+        self.assertEqual(sandbx.active_profile("codex", self.env), "default")
 
     def test_rejects_malformed_json(self):
         self.profiles_json().parent.mkdir(parents=True, exist_ok=True)
@@ -1217,46 +1287,109 @@ class TestProfilesJson(ProfileTmpDir, unittest.TestCase):
         with self.assertRaises(SandboxError):
             sandbx.load_profiles(self.env)
 
-    def test_rejects_empty_profiles_list(self):
-        sandbx.save_profiles({"profiles": ["x"], "active": "x"}, self.env)
-        self.profiles_json().write_text('{"profiles": [], "active": "x"}')
-        with self.assertRaises(SandboxError):
-            sandbx.load_profiles(self.env)
+    def test_rejects_malformed_documents(self):
+        self.profiles_json().parent.mkdir(parents=True, exist_ok=True)
+        for doc in ([], {"version": 3, "agents": {}}, {"version": 2},
+                    {"version": 2, "agents": []}):
+            with self.subTest(doc=doc):
+                self.profiles_json().write_text(json.dumps(doc))
+                with self.assertRaises(SandboxError):
+                    sandbx.load_profiles(self.env)
 
-    def test_rejects_active_not_in_list(self):
-        sandbx.save_profiles({"profiles": ["x"], "active": "x"}, self.env)
-        self.profiles_json().write_text('{"profiles": ["a"], "active": "b"}')
-        with self.assertRaises(SandboxError):
-            sandbx.load_profiles(self.env)
+    def test_rejects_malformed_agent_entries(self):
+        self.profiles_json().parent.mkdir(parents=True, exist_ok=True)
+        for entry in (["default"],
+                      {"profiles": [], "active": "default"},
+                      {"profiles": ["default"], "active": "gone"},
+                      {"profiles": ["default", "../escape"], "active": "default"},
+                      {"profiles": ["default", "default"], "active": "default"}):
+            with self.subTest(entry=entry):
+                self.profiles_json().write_text(json.dumps(
+                    {"version": 2, "agents": {"claude": entry}}))
+                with self.assertRaises(SandboxError) as ctx:
+                    sandbx.load_profiles(self.env)
+                self.assertIn("claude", str(ctx.exception))
 
-    def test_active_profile_shorthand(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "work"},
-                             self.env)
-        self.assertEqual(sandbx.active_profile(env=self.env), "work")
 
-    def test_per_agent_active_overrides_global(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "work", "private"], "active": "default",
-             "agent_active": {"claude": "private", "copilot": "work"}},
-            self.env)
-        self.assertEqual(sandbx.active_profile(agent="claude", env=self.env),
-                         "private")
-        self.assertEqual(sandbx.active_profile(agent="copilot", env=self.env),
-                         "work")
-        self.assertEqual(sandbx.active_profile(agent="codex", env=self.env),
-                         "default")
-        self.assertEqual(sandbx.active_profile(env=self.env), "default")
+class TestMigrateV1(ProfileTmpDir, unittest.TestCase):
+    """The old file held one global profile list for every agent."""
 
-    def test_rejects_agent_active_pointing_to_unknown_profile(self):
-        sandbx.save_profiles(
-            {"profiles": ["default"], "active": "default",
-             "agent_active": {"claude": "default"}}, self.env)
-        self.profiles_json().write_text(json.dumps(
-            {"profiles": ["default"], "active": "default",
-             "agent_active": {"claude": "gone"}}))
-        with self.assertRaises(SandboxError):
-            sandbx.load_profiles(self.env)
+    def write_v1(self, data):
+        self.profiles_json().parent.mkdir(parents=True, exist_ok=True)
+        self.raw = json.dumps(data)
+        self.profiles_json().write_text(self.raw)
 
+    def load(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            data = sandbx.load_profiles(self.env)
+        return data, err.getvalue()
+
+    def test_agents_keep_only_profiles_they_use(self):
+        self.write_v1({"profiles": ["default", "work", "private", "stale"],
+                       "active": "default",
+                       "agent_active": {"copilot": "private"}})
+        self.state("claude", "work")
+        data, _ = self.load()
+        self.assertEqual(sandbx.agent_entry(data, "claude"),
+                         {"profiles": ["default", "work"], "active": "default"})
+        self.assertEqual(sandbx.agent_entry(data, "copilot"),
+                         {"profiles": ["default", "private"], "active": "private"})
+        self.assertEqual(sandbx.agent_entry(data, "codex"),
+                         {"profiles": ["default"], "active": "default"})
+
+    def test_unlisted_state_dirs_are_kept(self):
+        """v1 let -p name a profile the list did not have."""
+        self.write_v1({"profiles": ["default", "work"], "active": "default"})
+        self.state("claude", "work")
+        self.state("claude", "adhoc")
+        data, _ = self.load()
+        self.assertEqual(sandbx.agent_entry(data, "claude"),
+                         {"profiles": ["default", "work", "adhoc"],
+                          "active": "default"})
+        self.assertEqual(sandbx.agent_entry(data, "codex"),
+                         {"profiles": ["default"], "active": "default"})
+
+    def test_global_active_applies_to_agents_without_an_override(self):
+        self.write_v1({"profiles": ["default", "work"], "active": "work",
+                       "agent_active": {"claude": "default"}})
+        data, _ = self.load()
+        self.assertEqual(sandbx.agent_entry(data, "claude"),
+                         {"profiles": ["default"], "active": "default"})
+        self.assertEqual(sandbx.agent_entry(data, "codex"),
+                         {"profiles": ["default", "work"], "active": "work"})
+
+    def test_a_renamed_default_is_not_brought_back(self):
+        self.write_v1({"profiles": ["personal"], "active": "personal"})
+        data, _ = self.load()
+        for name in AGENTS:
+            with self.subTest(agent=name):
+                self.assertEqual(sandbx.agent_entry(data, name),
+                                 {"profiles": ["personal"], "active": "personal"})
+
+    def test_file_is_rewritten_once_and_the_original_kept(self):
+        self.write_v1({"profiles": ["default"], "active": "default"})
+        data, err = self.load()
+        self.assertIn("migrated", err)
+        self.assertEqual(json.loads(self.profiles_json().read_text()), data)
+        backup = self.profiles_json().with_name("profiles.v1.json")
+        self.assertEqual(backup.read_text(), self.raw)
+        again, err = self.load()
+        self.assertEqual(again, data)
+        self.assertEqual(err, "")
+
+    def test_invalid_v1_is_refused_and_left_alone(self):
+        for doc in ({"profiles": ["a"], "active": "b"},
+                    {"profiles": [], "active": "a"},
+                    {"profiles": ["a"], "active": "a", "agent_active": {"claude": "x"}},
+                    {"profiles": ["a", "../x"], "active": "a"}):
+            with self.subTest(doc=doc):
+                self.write_v1(doc)
+                with self.assertRaises(SandboxError):
+                    self.load()
+                self.assertEqual(self.profiles_json().read_text(), self.raw)
+                self.assertFalse(
+                    self.profiles_json().with_name("profiles.v1.json").exists())
 
 
 class TestProfileMount(unittest.TestCase):
@@ -1308,218 +1441,203 @@ class TestProfileMount(unittest.TestCase):
 
 
 class TestProfileCli(CliRunner, unittest.TestCase):
-    def test_dry_run_with_profile(self):
-        rc, out, _ = self.run_cli("claude", ["--profile", "work", "--dry-run"])
+    def test_dry_run_with_a_registered_profile(self):
+        rc, out, _ = self.run_cli(
+            "claude", ["--profile", "work", "--dry-run"],
+            profiles={"claude": {"profiles": ["default", "work"],
+                                 "active": "default"}})
         self.assertEqual(rc, 0)
         args = shlex.split(out)
         self.assertIn("SANDBX_PROFILE=work", args)
-        config_mount = mounts(args)[0]
-        self.assertIn("/work:", config_mount)
+        self.assertIn("/work:", mounts(args)[0])
 
     def test_default_profile_when_omitted(self):
         rc, out, _ = self.run_cli("claude", ["--dry-run"])
         self.assertEqual(rc, 0)
         self.assertIn("SANDBX_PROFILE=default", shlex.split(out))
 
+    def test_omitted_profile_is_the_agents_own_active(self):
+        profiles = {"claude": {"profiles": ["default", "work"], "active": "work"}}
+        _, out, _ = self.run_cli("claude", ["--dry-run"], profiles=profiles)
+        self.assertIn("SANDBX_PROFILE=work", shlex.split(out))
+        _, out, _ = self.run_cli("codex", ["--dry-run"], profiles=profiles)
+        self.assertIn("SANDBX_PROFILE=default", shlex.split(out))
+
+    def test_unknown_profile_is_refused_with_a_hint(self):
+        with self.assertRaises(SandboxError) as ctx:
+            self.run_cli("claude", ["-p", "work", "--dry-run"])
+        self.assertIn("sandbx profile create claude work", str(ctx.exception))
+
+    def test_another_agents_profile_is_refused(self):
+        with self.assertRaises(SandboxError):
+            self.run_cli("claude", ["-p", "work"], real=True, profiles={
+                "codex": {"profiles": ["default", "work"], "active": "work"}})
+        self.execvp.assert_not_called()
+
     def test_creates_profile_subdir(self):
-        self.run_cli("claude", ["--profile", "work"], real=True)
+        self.run_cli("claude", ["--profile", "work"], real=True, profiles={
+            "claude": {"profiles": ["default", "work"], "active": "default"}})
         args = self.execvp.call_args.args[1]
-        config_mount = mounts(args)[0]
-        self.assertIn("/work:", config_mount)
+        self.assertIn("/work:", mounts(args)[0])
 
 
 class TestProfileCommand(ProfileTmpDir, unittest.TestCase):
-    """Tests for `sandbx profile` subcommands."""
+    """`sandbx profile` acts on one agent's profiles only."""
 
-    def run_profile(self, *args):
-        out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
-             contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(err):
-            rc = sandbx.cmd_profile(list(args))
-        return rc, out.getvalue(), err.getvalue()
-
-    def test_create_adds_to_list(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
-        rc, out, _ = self.run_profile("create", "work")
+    def test_create_adds_to_that_agent_only(self):
+        rc, _, _ = self.run_profile("create", "claude", "work")
         self.assertEqual(rc, 0)
-        data = sandbx.load_profiles(self.env)
-        self.assertIn("work", data["profiles"])
+        self.assertEqual(self.entry("claude")["profiles"], ["default", "work"])
+        self.assertEqual(self.entry("codex")["profiles"], ["default"])
+
+    def test_create_says_when_it_takes_over_a_leftover_dir(self):
+        self.save(claude=(["default"], "default"))
+        leftover = self.state("claude", "work")
+        rc, _, err = self.run_profile("create", "claude", "work")
+        self.assertEqual(rc, 0)
+        self.assertTrue((leftover / "creds.json").exists())
+        self.assertIn(str(leftover), err)
+        self.assertIn("sandbx reset claude -p work", err)
+        _, _, err = self.run_profile("create", "claude", "fresh")
+        self.assertEqual(err, "")
 
     def test_create_rejects_duplicate(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
         with self.assertRaises(SandboxError):
-            self.run_profile("create", "default")
+            self.run_profile("create", "claude", "default")
 
     def test_create_validates_name(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
         with self.assertRaises(SandboxError):
-            self.run_profile("create", "../bad")
+            self.run_profile("create", "claude", "../bad")
 
-    def test_list_shows_profiles_and_active_marker(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "work"},
-                             self.env)
+    def test_every_action_requires_an_agent(self):
+        for args in (["create", "work"], ["set", "work"], ["delete", "work"],
+                     ["rename", "work", "job"], ["create", "gemini", "work"]):
+            with self.subTest(args=args):
+                with self.assertRaises(SystemExit):
+                    self.run_profile(*args)
+
+    def test_same_name_on_two_agents_is_independent(self):
+        self.save(claude=(["default", "work"], "default"),
+                  codex=(["default", "work"], "default"))
+        claude_work = self.state("claude", "work")
+        self.state("codex", "work")
+        self.run_profile("delete", "codex", "work", "-y")
+        self.assertNotIn("work", self.entry("codex")["profiles"])
+        self.assertIn("work", self.entry("claude")["profiles"])
+        self.assertTrue((claude_work / "creds.json").exists())
+
+    def test_list_groups_profiles_by_agent(self):
+        self.save(claude=(["default", "work"], "work"))
         rc, out, _ = self.run_profile("list")
         self.assertEqual(rc, 0)
-        self.assertIn("work (active)", out)
-        self.assertIn("default", out)
-        self.assertNotIn("default (active)", out)
+        self.assertIn("claude:\n  default\n  work (active)\n", out)
+        self.assertIn("codex:\n  default (active)\n", out)
 
-    def test_rename_updates_registry_and_dirs(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default"},
-                             self.env)
-        (self.agents_root / "claude" / "work").mkdir(parents=True)
-        (self.agents_root / "claude" / "work" / "creds.json").write_text("{}")
-        rc, _, _ = self.run_profile("rename", "work", "job")
+    def test_list_one_agent(self):
+        _, out, _ = self.run_profile("list", "claude")
+        self.assertEqual(out, "claude:\n  default (active)\n")
+
+    def test_rename_moves_only_that_agents_state(self):
+        self.save(claude=(["default", "work"], "work"),
+                  codex=(["default", "work"], "work"))
+        self.state("claude", "work")
+        codex_work = self.state("codex", "work")
+        rc, _, _ = self.run_profile("rename", "claude", "work", "job")
         self.assertEqual(rc, 0)
-        data = sandbx.load_profiles(self.env)
-        self.assertIn("job", data["profiles"])
-        self.assertNotIn("work", data["profiles"])
+        self.assertEqual(self.entry("claude"),
+                         {"profiles": ["default", "job"], "active": "job"})
         self.assertTrue((self.agents_root / "claude" / "job" / "creds.json").exists())
         self.assertFalse((self.agents_root / "claude" / "work").exists())
+        self.assertEqual(self.entry("codex"),
+                         {"profiles": ["default", "work"], "active": "work"})
+        self.assertTrue(codex_work.exists())
 
-    def test_rename_updates_active_if_needed(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "work"},
-                             self.env)
-        self.run_profile("rename", "work", "job")
-        self.assertEqual(sandbx.active_profile(env=self.env), "job")
+    def test_rename_rejects_unknown_or_duplicate_names(self):
+        self.save(claude=(["default", "work"], "default"))
+        for args in (["nope", "new"], ["work", "default"],
+                     ["../escape", "safe"], ["work", "../escape"]):
+            with self.subTest(args=args):
+                with self.assertRaises(SandboxError):
+                    self.run_profile("rename", "claude", *args)
 
-    def test_rename_rejects_nonexistent(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
+    def test_rename_refuses_to_adopt_a_leftover_dir(self):
+        self.save(claude=(["default", "work"], "default"))
+        work = self.state("claude", "work")
+        self.state("claude", "job")
         with self.assertRaises(SandboxError):
-            self.run_profile("rename", "nope", "new")
-
-    def test_rename_rejects_duplicate_target(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default"},
-                             self.env)
-        with self.assertRaises(SandboxError):
-            self.run_profile("rename", "work", "default")
+            self.run_profile("rename", "claude", "work", "job")
+        self.assertTrue(work.exists())
+        self.assertIn("work", self.entry("claude")["profiles"])
 
     def test_delete_removes_state_and_registry_entry(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default"},
-                             self.env)
-        (self.agents_root / "claude" / "work").mkdir(parents=True)
-        (self.agents_root / "claude" / "work" / "creds.json").write_text("{}")
-        rc, _, _ = self.run_profile("delete", "work", "-y")
+        self.save(claude=(["default", "work"], "default"))
+        work = self.state("claude", "work")
+        rc, _, _ = self.run_profile("delete", "claude", "work", "-y")
         self.assertEqual(rc, 0)
-        data = sandbx.load_profiles(self.env)
-        self.assertNotIn("work", data["profiles"])
-        self.assertFalse((self.agents_root / "claude" / "work").exists())
+        self.assertEqual(self.entry("claude")["profiles"], ["default"])
+        self.assertFalse(work.exists())
 
-    def test_delete_rejects_active_profile(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default"},
-                             self.env)
+    def test_delete_rejects_active_or_unknown_profile(self):
+        self.save(claude=(["default", "work"], "work"))
+        for name in ("work", "nope"):
+            with self.subTest(name=name):
+                with self.assertRaises(SandboxError):
+                    self.run_profile("delete", "claude", name, "-y")
+        # Only one profile left means it is the active one.
         with self.assertRaises(SandboxError):
-            self.run_profile("delete", "default", "-y")
+            self.run_profile("delete", "codex", "default", "-y")
 
-    def test_delete_rejects_only_profile(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
+    def test_delete_confirms_with_agent_and_profile(self):
+        self.save(claude=(["default", "work"], "default"))
+        work = self.state("claude", "work")
+        with unittest.mock.patch("builtins.input", return_value="work"):
+            rc, out, _ = self.run_profile("delete", "claude", "work")
+        self.assertEqual(rc, 1)
+        self.assertIn("aborted", out)
+        self.assertTrue(work.exists())
+        self.assertIn("work", self.entry("claude")["profiles"])
+        with unittest.mock.patch("builtins.input", return_value="claude/work"):
+            rc, _, _ = self.run_profile("delete", "claude", "work")
+        self.assertEqual(rc, 0)
+        self.assertFalse(work.exists())
+
+    def test_set_changes_only_that_agent(self):
+        self.save(claude=(["default", "work"], "default"),
+                  codex=(["default", "work"], "default"))
+        rc, out, _ = self.run_profile("set", "claude", "work")
+        self.assertEqual(rc, 0)
+        self.assertIn("claude active profile: work", out)
+        self.assertEqual(sandbx.active_profile("claude", self.env), "work")
+        self.assertEqual(sandbx.active_profile("codex", self.env), "default")
+
+    def test_set_rejects_another_agents_profile(self):
+        self.save(codex=(["default", "work"], "default"))
         with self.assertRaises(SandboxError):
-            self.run_profile("delete", "default", "-y")
-
-    def test_set_changes_active(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default"},
-                             self.env)
-        rc, _, _ = self.run_profile("set", "work")
-        self.assertEqual(rc, 0)
-        self.assertEqual(sandbx.active_profile(env=self.env), "work")
-
-    def test_set_rejects_unknown_profile(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
-        with self.assertRaises(SandboxError):
-            self.run_profile("set", "nope")
-
-    def test_set_per_agent(self):
-        sandbx.save_profiles({"profiles": ["default", "work", "private"],
-                              "active": "default", "agent_active": {}},
-                             self.env)
-        rc, out, _ = self.run_profile("set", "private", "--agent", "claude")
-        self.assertEqual(rc, 0)
-        self.assertIn("claude", out)
-        self.assertEqual(sandbx.active_profile(agent="claude", env=self.env),
-                         "private")
-        self.assertEqual(sandbx.active_profile(env=self.env), "default")
-
-    def test_set_per_agent_does_not_change_global(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default",
-                              "agent_active": {}}, self.env)
-        self.run_profile("set", "work", "--agent", "copilot")
-        self.assertEqual(sandbx.active_profile(env=self.env), "default")
-        self.assertEqual(sandbx.active_profile(agent="copilot", env=self.env),
-                         "work")
-
-    def test_rename_updates_agent_active(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "work"], "active": "default",
-             "agent_active": {"claude": "work"}}, self.env)
-        self.run_profile("rename", "work", "job")
-        data = sandbx.load_profiles(self.env)
-        self.assertEqual(data["agent_active"]["claude"], "job")
-
-    def test_delete_clears_agent_active(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "work"], "active": "default",
-             "agent_active": {"claude": "work"}}, self.env)
-        rc, _, _ = self.run_profile("delete", "work", "-y")
-        self.assertEqual(rc, 0)
-        data = sandbx.load_profiles(self.env)
-        self.assertNotIn("claude", data.get("agent_active", {}))
-
-    def test_list_shows_agent_overrides(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "work"], "active": "default",
-             "agent_active": {"claude": "work"}}, self.env)
-        rc, out, _ = self.run_profile("list")
-        self.assertEqual(rc, 0)
-        self.assertIn("claude: work", out)
+            self.run_profile("set", "claude", "work")
 
 
 class TestResetWithProfiles(ProfileTmpDir, unittest.TestCase):
-    def run_reset(self, *args):
-        out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
-             contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(err):
-            rc = sandbx.cmd_reset(list(args))
-        return rc, out.getvalue(), err.getvalue()
-
-    def test_resets_active_profile_by_default(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
-        d = self.agents_root / "claude" / "default"
-        d.mkdir(parents=True)
-        (d / "creds.json").write_text("{}")
-        rc, out, _ = self.run_reset("claude", "-y")
+    def test_resets_the_agents_active_profile_by_default(self):
+        self.save(claude=(["default", "work"], "work"))
+        work = self.state("claude", "work")
+        default = self.state("claude", "default")
+        rc, _, _ = self.run_reset("claude", "-y")
         self.assertEqual(rc, 0)
-        self.assertFalse(d.exists())
+        self.assertFalse(work.exists())
+        self.assertTrue(default.exists())
 
     def test_resets_named_profile(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default"},
-                             self.env)
-        d = self.agents_root / "claude" / "work"
-        d.mkdir(parents=True)
-        (d / "creds.json").write_text("{}")
+        self.save(claude=(["default", "work"], "default"))
+        work = self.state("claude", "work")
+        default = self.state("claude", "default")
         rc, _, _ = self.run_reset("claude", "--profile", "work", "-y")
         self.assertEqual(rc, 0)
-        self.assertFalse(d.exists())
-        # default profile is untouched
-        default = self.agents_root / "claude" / "default"
-        default.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(work.exists())
         self.assertTrue(default.exists())
 
     def test_all_profiles_wipes_entire_agent_dir(self):
-        sandbx.save_profiles({"profiles": ["default", "work"], "active": "default"},
-                             self.env)
         for p in ("default", "work"):
-            d = self.agents_root / "claude" / p
-            d.mkdir(parents=True)
-            (d / "creds.json").write_text("{}")
+            self.state("claude", p)
         rc, _, _ = self.run_reset("claude", "--all-profiles", "-y")
         self.assertEqual(rc, 0)
         self.assertFalse((self.agents_root / "claude").exists())
@@ -1529,8 +1647,6 @@ class TestResetWithProfiles(ProfileTmpDir, unittest.TestCase):
             self.run_reset("claude", "--profile", "x", "--all-profiles", "-y")
 
     def test_nothing_to_reset(self):
-        sandbx.save_profiles({"profiles": ["default"], "active": "default"},
-                             self.env)
         self.agents_root.mkdir(parents=True, exist_ok=True)
         rc, out, _ = self.run_reset("claude", "-y")
         self.assertEqual(rc, 0)
@@ -1569,59 +1685,6 @@ class TestAssertPathWithin(unittest.TestCase):
             link.symlink_to(escape)
             with self.assertRaises(SandboxError):
                 sandbx.assert_path_within(link, root, root)
-
-
-class TestRenameValidatesOldName(ProfileTmpDir, unittest.TestCase):
-    """_profile_rename must validate the old name to prevent path traversal."""
-
-    def run_profile(self, *args):
-        out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
-             contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(err):
-            rc = sandbx.cmd_profile(list(args))
-        return rc, out.getvalue(), err.getvalue()
-
-    def test_rejects_traversal_in_old_name(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "../escape"], "active": "default"},
-            self.env)
-        with self.assertRaises(SandboxError):
-            self.run_profile("rename", "../escape", "safe")
-
-    def test_rename_to_invalid_name_rejected(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "work"], "active": "default"}, self.env)
-        with self.assertRaises(SandboxError):
-            self.run_profile("rename", "work", "../escape")
-
-
-class TestRenameAtomicity(ProfileTmpDir, unittest.TestCase):
-    """_profile_rename must not leave partial renames on failure."""
-
-    def run_profile(self, *args):
-        out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
-             contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(err):
-            rc = sandbx.cmd_profile(list(args))
-        return rc, out.getvalue(), err.getvalue()
-
-    def test_no_dirs_moved_when_one_destination_exists(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "work"], "active": "default"}, self.env)
-        agents = list(AGENTS.values())
-        # Create source dirs for the first two agents
-        for agent in agents[:2]:
-            (self.agents_root / agent.state_dir / "work").mkdir(parents=True)
-        # Pre-create a destination that will block the rename for the second agent
-        (self.agents_root / agents[1].state_dir / "job").mkdir(parents=True)
-        with self.assertRaises(SandboxError):
-            self.run_profile("rename", "work", "job")
-        # First agent's source must NOT have been moved
-        self.assertTrue(
-            (self.agents_root / agents[0].state_dir / "work").exists(),
-            "source dir was moved despite later failure")
 
 
 class TestExecvpError(unittest.TestCase):
@@ -1697,82 +1760,33 @@ class TestSplitPassthrough(unittest.TestCase):
 
 
 class TestList(ProfileTmpDir, unittest.TestCase):
-    """cmd_list was previously untested."""
-
-    def test_shows_agent_names_and_active_profile(self):
-        sandbx.save_profiles(
-            {"profiles": ["default", "work"], "active": "work"}, self.env)
-        for agent in AGENTS.values():
-            (self.agents_root / agent.state_dir / "default").mkdir(parents=True)
-            (self.agents_root / agent.state_dir / "work").mkdir(parents=True)
-        out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
-             unittest.mock.patch("sandbx.image_exists", return_value=False), \
-             contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(err):
-            rc = sandbx.cmd_list([])
-        self.assertEqual(rc, 0)
-        output = out.getvalue()
-        self.assertIn("active profile: work", output)
-        for name in AGENTS:
-            self.assertIn(name, output)
-
-    def test_shows_no_state_for_empty_agents(self):
-        sandbx.save_profiles(
-            {"profiles": ["default"], "active": "default"}, self.env)
-        self.agents_root.mkdir(parents=True, exist_ok=True)
+    def rows(self):
         out = io.StringIO()
         with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
              unittest.mock.patch("sandbx.image_exists", return_value=False), \
              contextlib.redirect_stdout(out):
-            sandbx.cmd_list([])
-        self.assertIn("(no state)", out.getvalue())
+            rc = sandbx.cmd_list([])
+        self.assertEqual(rc, 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[0].split(),
+                         ["AGENT", "IMAGE", "BUILT", "ACTIVE", "PROFILES"])
+        return {line.split()[0]: line.split(None, 4) for line in lines[1:]}
+
+    def test_shows_each_agents_active_and_profiles(self):
+        self.save(claude=(["default", "work"], "work"))
+        rows = self.rows()
+        self.assertEqual(sorted(rows), sorted(AGENTS))
+        self.assertEqual(rows["claude"][3:], ["work", "default, work"])
+        self.assertEqual(rows["codex"][3:], ["default", "default"])
 
 
-class TestProfileBoundary(ProfileTmpDir, unittest.TestCase):
-    """Profile boundary cases from the review."""
-
-    def run_profile(self, *args):
-        out, err = io.StringIO(), io.StringIO()
-        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
-             contextlib.redirect_stdout(out), \
-             contextlib.redirect_stderr(err):
-            rc = sandbx.cmd_profile(list(args))
-        return rc, out.getvalue(), err.getvalue()
-
+class TestProfileBoundary(unittest.TestCase):
     def test_boundary_length_64_accepted(self):
         sandbx.validate_profile_name("a" * 64)
 
     def test_boundary_length_65_rejected(self):
         with self.assertRaises(SandboxError):
             sandbx.validate_profile_name("a" * 65)
-
-    def test_create_without_existing_profiles_json(self):
-        """First-ever create works from the implicit default."""
-        rc, _, _ = self.run_profile("create", "work")
-        self.assertEqual(rc, 0)
-        data = sandbx.load_profiles(self.env)
-        self.assertIn("work", data["profiles"])
-        self.assertIn("default", data["profiles"])
-
-    def test_reset_uses_per_agent_active(self):
-        """reset claude should use agent-specific active, not global."""
-        sandbx.save_profiles(
-            {"profiles": ["default", "work"], "active": "default",
-             "agent_active": {"claude": "work"}}, self.env)
-        d = self.agents_root / "claude" / "work"
-        d.mkdir(parents=True)
-        (d / "creds.json").write_text("{}")
-        default_d = self.agents_root / "claude" / "default"
-        default_d.mkdir(parents=True)
-        (default_d / "keep.json").write_text("{}")
-        out = io.StringIO()
-        with unittest.mock.patch.dict(sandbx.os.environ, self.env), \
-             contextlib.redirect_stdout(out):
-            rc = sandbx.cmd_reset(["claude", "-y"])
-        self.assertEqual(rc, 0)
-        self.assertFalse(d.exists(), "work profile should be deleted")
-        self.assertTrue(default_d.exists(), "default profile should be untouched")
 
 
 if __name__ == "__main__":

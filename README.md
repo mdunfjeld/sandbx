@@ -30,20 +30,19 @@ sandbx <agent> --dry-run           print the podman command, run nothing
 sandbx <agent> --no-relabel        skip SELinux :z relabeling
 sandbx <agent> --ram 8G --cpus 4   size the VM (krun only)
 sandbx <agent> --runtime crun      plain container, no VM
-sandbx <agent> -p work             run with a named profile
+sandbx <agent> -p work             run with one of the agent's profiles
 
 sandbx build [agent]               build images (base only if missing)
 sandbx build --base --no-cache     rebuild base from scratch
 sandbx list                        show agents, images, profiles
-sandbx reset <agent> [-y]          delete active profile's state
+sandbx reset <agent> [-y]          delete the agent's active profile's state
 sandbx reset <agent> --all-profiles
 
-sandbx profile list
-sandbx profile create <name>
-sandbx profile rename <old> <new>
-sandbx profile delete <name> [-y]
-sandbx profile set <name>          set the global default profile
-sandbx profile set <name> --agent claude   per-agent default
+sandbx profile list [agent]
+sandbx profile create <agent> <name>
+sandbx profile rename <agent> <old> <new>
+sandbx profile delete <agent> <name> [-y]
+sandbx profile set <agent> <name>  set the agent's active profile
 ```
 
 Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe`.
@@ -51,22 +50,33 @@ Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe`.
 ## Profiles
 
 Profiles let you maintain separate login sessions per agent — e.g. personal
-and work credentials.
+and work credentials. Each agent has its own profiles and its own active
+profile; creating, renaming or deleting a claude profile never touches codex.
 
 ```
 ~/.local/share/sandbx/
-  profiles.json
+  profiles.json   # per agent: its profiles and which one is active
   agents/
     claude/
-      default/    # mounted when profile=default
-      work/       # mounted when profile=work
+      default/    # mounted when claude runs with profile=default
+      work/       # mounted when claude runs with profile=work
     codex/
       default/
 ```
 
-A `default` profile is created automatically. Use `sandbx profile set work
---agent claude` so `sandbx claude .` always uses the work profile without
-`-p work`.
+Every agent starts with a `default` profile. After `sandbx profile create
+claude work` and `sandbx profile set claude work`, `sandbx claude .` uses the
+work profile without `-p work`. `-p` only accepts a profile the agent already
+has, so a typo fails instead of starting a fresh, logged-out session.
+
+A `profiles.json` from before per-agent profiles is migrated on first use:
+each agent keeps `default`, its active profile and any profile with state on
+disk, listed or not. The old file is kept as `profiles.v1.json`. Without a
+`profiles.json`, an agent's state directories are its profiles.
+
+`sandbx profile create` on a name that already has state on disk takes that
+state over, credentials included, and says so. Run `sandbx reset <agent> -p
+<name>` to empty it.
 
 ## Isolation guarantees
 
