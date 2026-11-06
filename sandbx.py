@@ -717,6 +717,82 @@ def resolve_project(raw: str) -> Path:
     return project
 
 
+def use_color(stream=None, env: Mapping[str, str] | None = None) -> bool:
+    """Whether to color what goes to *stream* (default stderr): only when it is
+    a terminal, and never with NO_COLOR set (no-color.org) or TERM=dumb."""
+    stream = sys.stderr if stream is None else stream
+    env = os.environ if env is None else env
+    if env.get("NO_COLOR") or env.get("TERM") == "dumb":
+        return False
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError):  # no isatty, or already closed
+        return False
+
+
+def _ansi(text: str, code: str, color: bool) -> str:
+    """*text* in SGR *code* (e.g. "1;36"), or untouched when not coloring."""
+    return f"\033[{code}m{text}\033[0m" if color else text
+
+
+# The banner's runtime row: a color and a few words on what isolation you got.
+# Yellow for crun, because a plain container shares the host kernel.
+RUNTIME_BANNER = {
+    VM_RUNTIME: ("1;32", "microVM, own kernel"),
+    CONTAINER_RUNTIME: ("1;33", "container, host kernel"),
+}
+_BANNER_TITLE = " sandbx "
+_BANNER_MIN_WIDTH = 46
+
+
+def sandbox_banner(name: str, profile: str, runtime: str, host_block: int, *,
+                   shell: bool = False, color: bool = False) -> str:
+    """The box every run prints before the sandbox starts; shell=True adds a
+    hint below it on how to start the agent. Pure, so tests can check it; every
+    cell is padded as plain text and only then colored, so the right border
+    lines up whether or not color is on.
+    """
+    try:
+        runtime_code, runtime_desc = RUNTIME_BANNER[runtime]
+    except KeyError:
+        raise SandboxError(
+            f"unknown runtime {runtime!r} (known: {', '.join(RUNTIMES)})"
+        ) from None
+    # (label, [(text, SGR code), ...]) per row; cells are two spaces apart.
+    rows = [
+        ("agent", [(name, "1")]),
+        ("profile", [(profile, "1")]),
+        ("runtime", [(runtime, runtime_code), (runtime_desc, "2")]),
+        ("ports", [(port_span(block_ports(host_block)), "1;36"),
+                   ("$SANDBX_HOST_PORTS", "2")]),
+    ]
+    label_w = max(len(label) for label, _ in rows) + 4
+
+    def plain(cells):
+        return "  ".join(text for text, _ in cells)
+
+    width = max(_BANNER_MIN_WIDTH,
+                *(2 + label_w + len(plain(cells)) + 2 for _, cells in rows))
+
+    def border(text: str) -> str:
+        return _ansi(text, "36", color)
+
+    lines = [border("╭─") + _ansi(_BANNER_TITLE, "1;35", color)
+             + border("─" * (width - 1 - len(_BANNER_TITLE)) + "╮")]
+    for label, cells in rows:
+        pad = width - 2 - label_w - len(plain(cells))
+        value = "  ".join(_ansi(text, code, color) for text, code in cells)
+        lines.append(border("│") + "  " + _ansi(label.ljust(label_w), "2", color)
+                     + value + " " * pad + border("│"))
+    lines.append(border("╰" + "─" * width + "╯"))
+    if shell:
+        command = shlex.join(AGENTS[name].command)
+        lines.append("  " + _ansi(f"{name} not started; run ", "2", color)
+                     + _ansi(f"`{command}`", "1", color)
+                     + _ansi(" to launch it", "2", color))
+    return "\n".join(lines)
+
+
 def split_passthrough(argv: Sequence[str]) -> tuple[list[str], list[str]]:
     """Split on the first `--`; everything after it goes to the agent."""
     argv = list(argv)
@@ -808,11 +884,8 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
     # after the checks above so a failed launch leaves no stray state behind.
     (agents_root / AGENTS[name].state_dir / profile).mkdir(
         parents=True, exist_ok=True)
-    print(f"sandbx: profile={profile}, ports {port_span(block_ports(host_block))} "
-          "inside reach the same ports on host 127.0.0.1", file=sys.stderr)
-    if opts.shell:
-        print(f"sandbx: {name} not started; run "
-              f"`{shlex.join(AGENTS[name].command)}` to launch it", file=sys.stderr)
+    print(sandbox_banner(name, profile, opts.runtime, host_block,
+                         shell=opts.shell, color=use_color()), file=sys.stderr)
     try:
         os.execvp("podman", args)  # replaces this process; keeps the TTY clean
     except OSError as exc:

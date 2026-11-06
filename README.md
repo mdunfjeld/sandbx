@@ -45,6 +45,9 @@ sandbx profile delete <agent> <name> [-y]
 sandbx profile set <agent> <name>  set the agent's active profile
 ```
 
+Every launch prints a box with the agent, profile, runtime and port block;
+`--shell` adds how to start the agent from the shell.
+
 Agents: `claude`, `codex`, `copilot`, `opencode`, `vibe`.
 
 ## Profiles

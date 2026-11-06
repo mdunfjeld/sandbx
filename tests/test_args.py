@@ -10,6 +10,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import shlex
 import shutil
 import socket
@@ -472,12 +473,112 @@ class TestShellMode(CliRunner, unittest.TestCase):
                 args = self.execvp.call_args.args[1]
                 self.assertEqual(args[-2:], list(sandbx.SHELL_COMMAND))
 
-    def test_normal_run_prints_profile_and_port_line(self):
+    def test_normal_run_prints_the_banner_without_the_hint(self):
         _, _, err = self.run_cli("claude", [], real=True)
         self.assertEqual(
-            err, "sandbx: profile=default, ports 30010-30019 inside reach the "
-                 "same ports on host 127.0.0.1\n")
+            err, sandbx.sandbox_banner("claude", "default", "krun", 30010) + "\n")
+        self.assertNotIn("not started", err)
         self.assertEqual(self.execvp.call_args.args[1][-1], "claude")
+
+
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+class FakeTty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class TestBanner(CliRunner, unittest.TestCase):
+    """Every run prints a box with the agent, profile, runtime and port block;
+    --shell adds a hint below it on how to start the agent."""
+
+    def banner(self, name="claude", profile="default", runtime="krun",
+               block=30010, shell=True, color=False):
+        return sandbx.sandbox_banner(name, profile, runtime, block,
+                                     shell=shell, color=color)
+
+    def test_shows_every_field_for_every_agent_and_runtime(self):
+        for name, agent in AGENTS.items():
+            for runtime in sandbx.RUNTIMES:
+                with self.subTest(agent=name, runtime=runtime):
+                    text = self.banner(name, "work", runtime, 30020)
+                    for want in (name, "work", runtime, "30020-30029",
+                                 "$SANDBX_HOST_PORTS",
+                                 f"run `{shlex.join(agent.command)}`"):
+                        self.assertIn(want, text)
+
+    def test_hint_only_under_shell(self):
+        for name, agent in AGENTS.items():
+            with self.subTest(agent=name):
+                hint = f"run `{shlex.join(agent.command)}`"
+                self.assertIn(hint, self.banner(name, shell=True))
+                self.assertNotIn(hint, self.banner(name, shell=False))
+                # The box itself is the same either way.
+                self.assertTrue(self.banner(name, shell=True).startswith(
+                    self.banner(name, shell=False) + "\n"))
+
+    def test_runtimes_are_described_differently(self):
+        self.assertIn("microVM", self.banner(runtime="krun"))
+        self.assertIn("host kernel", self.banner(runtime="crun"))
+        self.assertNotIn("microVM", self.banner(runtime="crun"))
+
+    def test_unknown_runtime_is_a_clean_error(self):
+        with self.assertRaises(SandboxError):
+            self.banner(runtime="runc")
+
+    def test_plain_has_no_escapes(self):
+        self.assertNotIn("\033", self.banner())
+
+    def test_color_only_adds_escapes(self):
+        for runtime in sandbx.RUNTIMES:
+            with self.subTest(runtime=runtime):
+                colored = self.banner(runtime=runtime, color=True)
+                self.assertIn("\033[", colored)
+                self.assertEqual(ANSI.sub("", colored),
+                                 self.banner(runtime=runtime))
+
+    def test_box_borders_line_up(self):
+        for profile in ("default", "a" * 64):
+            for color in (False, True):
+                with self.subTest(profile=profile[:8], color=color):
+                    box = ANSI.sub("", self.banner(
+                        profile=profile, shell=False, color=color)).splitlines()
+                    self.assertEqual(len({len(line) for line in box}), 1, box)
+                    self.assertTrue(box[0].startswith("╭") and box[0].endswith("╮"))
+                    self.assertTrue(box[-1].startswith("╰") and box[-1].endswith("╯"))
+                    for line in box[1:-1]:
+                        self.assertTrue(line.startswith("│") and line.endswith("│"))
+
+    def test_use_color_only_on_a_terminal(self):
+        self.assertTrue(sandbx.use_color(FakeTty(), {"TERM": "xterm"}))
+        self.assertFalse(sandbx.use_color(io.StringIO(), {"TERM": "xterm"}))
+
+    def test_use_color_honours_no_color_and_dumb_terminals(self):
+        self.assertFalse(sandbx.use_color(FakeTty(), {"NO_COLOR": "1"}))
+        self.assertFalse(sandbx.use_color(FakeTty(), {"TERM": "dumb"}))
+        # no-color.org: an empty NO_COLOR does not count.
+        self.assertTrue(sandbx.use_color(FakeTty(), {"NO_COLOR": ""}))
+
+    def test_use_color_survives_a_stream_without_isatty(self):
+        self.assertFalse(sandbx.use_color(object(), {}))
+
+    def test_real_shell_run_prints_the_banner(self):
+        _, _, err = self.run_cli("codex", ["--shell", "-p", "work"], real=True,
+                                 profiles={"codex": {"profiles": ["default", "work"],
+                                                     "active": "default"}})
+        self.assertEqual(err, self.banner("codex", "work", "krun", 30010) + "\n")
+
+    def test_real_shell_run_shows_crun(self):
+        _, _, err = self.run_cli("claude", ["--shell", "--runtime", "crun"],
+                                 real=True)
+        self.assertIn("crun  container, host kernel", err)
+
+    def test_dry_run_prints_no_banner(self):
+        for args in (["--dry-run"], ["--dry-run", "--shell"]):
+            with self.subTest(args=args):
+                _, _, err = self.run_cli("claude", args)
+                self.assertEqual(err, "")
 
 
 class TestKvmCheck(CliRunner, unittest.TestCase):
