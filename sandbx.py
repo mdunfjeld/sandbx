@@ -72,6 +72,17 @@ VM_MAX_CPUS = 16
 TO_HOST_PORTS = (30000, 30009)
 # adb defaults to 5037, outside the range. The host server must use this too.
 ADB_SERVER_PORT = 30000
+# A krun VM gets a virtio-net NIC served by passt (krun.use_passt), not
+# libkrun's default TSI, which proxies every guest socket and holds its lock
+# through a blocking recv(): adb shell, reading on one thread and writing keys
+# on another, hung on the first key. With a real NIC the guest's 127.0.0.1 is
+# its own, so the VM starts through VM_NET, which DNATs 127.0.0.1:30000-30009
+# to VM_HOST_LOOPBACK; images/passt-wrapper maps that address to the
+# container's loopback, where pasta's -T forwards to the host listen. The guest
+# then sees the same ports as a crun container. Must match passt-wrapper.
+VM_HOST_LOOPBACK = "169.254.30.1"
+VM_NET = ("sandbx-vm-net", VM_HOST_LOOPBACK,
+          f"{TO_HOST_PORTS[0]}-{TO_HOST_PORTS[1]}", "--")
 # Inbound (-t): each sandbox takes the first free block of HOST_BLOCKS, and a
 # server the agent starts on one of its ports appears on the same port of the
 # host's 127.0.0.1. Those are host ports, so a fixed range would let only one
@@ -677,6 +688,7 @@ def build_podman_args(
         args += ["--annotation", f"krun.ram_mib={ram_mib}"]
         if cpus is not None:
             args += ["--annotation", f"krun.cpus={cpus}"]
+        args += ["--annotation", "krun.use_passt=1"]  # see VM_NET
     if not relabel:
         args += ["--security-opt", "label=disable"]
     args += [
@@ -697,6 +709,8 @@ def build_podman_args(
         args += ["-e", f"{key}={value}"]
     args.append(agent.image)
     if vm:
+        # VM_NET needs root for nft; AS_AGENT drops to agent right after.
+        args += list(VM_NET)
         args += list(AS_AGENT)
     if shell:
         args += list(SHELL_COMMAND)

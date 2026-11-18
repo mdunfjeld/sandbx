@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -314,10 +315,8 @@ class TestFlags(unittest.TestCase):
                         self.assertEqual(args[args.index("--user") + 1], "1000:1000")
                         self.assertNotIn("setpriv", args)
                     else:
-                        self.assertEqual(
-                            args[start:start + len(sandbx.AS_AGENT)],
-                            list(sandbx.AS_AGENT),
-                        )
+                        prefix = [*sandbx.VM_NET, *sandbx.AS_AGENT]
+                        self.assertEqual(args[start:start + len(prefix)], prefix)
 
     def test_vm_memory_is_set(self):
         """libkrun's 1 GiB default is too small; unset, builds run out of RAM."""
@@ -429,7 +428,8 @@ class TestShellMode(CliRunner, unittest.TestCase):
             with self.subTest(agent=name):
                 args = argv(name, shell=True)
                 tail = args[args.index(agent.image) + 1:]
-                self.assertEqual(tail, [*sandbx.AS_AGENT, *sandbx.SHELL_COMMAND])
+                self.assertEqual(
+                    tail, [*sandbx.VM_NET, *sandbx.AS_AGENT, *sandbx.SHELL_COMMAND])
 
     def test_sandbox_is_identical_up_to_the_image(self):
         for name, agent in AGENTS.items():
@@ -461,7 +461,8 @@ class TestShellMode(CliRunner, unittest.TestCase):
             with self.subTest(flag=flag):
                 rc, out, err = self.run_cli("claude", [flag, "--dry-run"])
                 self.assertEqual(rc, 0)
-                tail = shlex.join(["sandbx-claude", *sandbx.AS_AGENT, "/bin/bash", "-l"])
+                tail = shlex.join(["sandbx-claude", *sandbx.VM_NET, *sandbx.AS_AGENT,
+                                   "/bin/bash", "-l"])
                 self.assertTrue(out.strip().endswith(tail), out)
                 self.assertEqual(err, "")
 
@@ -610,11 +611,11 @@ class TestVmSize(CliRunner, unittest.TestCase):
     honours: out of it, crun swaps in its own default or libkrun refuses."""
 
     def test_defaults_set_ram_and_leave_cpus_to_crun(self):
-        self.assertEqual(annotations(argv()), ["krun.ram_mib=4096"])
+        self.assertEqual(annotations(argv()), ["krun.ram_mib=4096", "krun.use_passt=1"])
 
     def test_ram_and_cpus_pass_through(self):
         self.assertEqual(annotations(argv(ram_mib=8192, cpus=4)),
-                         ["krun.ram_mib=8192", "krun.cpus=4"])
+                         ["krun.ram_mib=8192", "krun.cpus=4", "krun.use_passt=1"])
 
     def test_ram_crun_would_ignore_is_rejected(self):
         for ram in (0, 64, sandbx.VM_MIN_RAM_MIB):
@@ -653,7 +654,7 @@ class TestVmSize(CliRunner, unittest.TestCase):
         rc, out, _ = self.run_cli("claude", ["--ram", "8G", "--cpus", "2", "--dry-run"])
         self.assertEqual(rc, 0)
         self.assertEqual(annotations(shlex.split(out)),
-                         ["krun.ram_mib=8192", "krun.cpus=2"])
+                         ["krun.ram_mib=8192", "krun.cpus=2", "krun.use_passt=1"])
 
     def test_cli_rejects_a_bad_size_or_count(self):
         with self.assertRaises(SystemExit):
@@ -665,15 +666,18 @@ class TestVmSize(CliRunner, unittest.TestCase):
 
     def test_cli_default_ram_comes_from_the_builder(self):
         _, out, _ = self.run_cli("claude", ["--dry-run"])
-        self.assertEqual(annotations(shlex.split(out)), ["krun.ram_mib=4096"])
+        self.assertEqual(annotations(shlex.split(out)),
+                         ["krun.ram_mib=4096", "krun.use_passt=1"])
 
 
 def without_runtime(args):
     """The argv minus everything that is allowed to differ between runtimes:
-    the runtime itself, the VM annotations, and how the workload becomes agent."""
-    args, n = list(args), len(sandbx.AS_AGENT)
+    the runtime itself, the VM annotations, and the VM's start-up prefix
+    (VM_NET's port routing, then AS_AGENT)."""
+    prefix = [*sandbx.VM_NET, *sandbx.AS_AGENT]
+    args, n = list(args), len(prefix)
     for i in range(len(args) - n + 1):
-        if args[i:i + n] == list(sandbx.AS_AGENT):
+        if args[i:i + n] == prefix:
             del args[i:i + n]
             break
     out, i = [], 0
@@ -828,6 +832,79 @@ class TestPorts(unittest.TestCase):
             sock.bind(("127.0.0.1", 0))
             sock.listen()
             self.assertFalse(sandbx._port_free(sock.getsockname()[1]))
+
+
+class TestVmNetwork(unittest.TestCase):
+    """A krun VM gets virtio-net (passt) instead of TSI, and its 127.0.0.1 is
+    routed to the host's reserved ports so the guest sees what crun sees."""
+
+    VM_NET_SCRIPT = sandbx.IMAGES_DIR / "sandbx-vm-net"
+
+    def test_every_vm_uses_passt_and_routes_the_host_ports(self):
+        for kw in OPTION_SETS:
+            if kw.get("runtime") == "crun":
+                continue
+            for name, agent in AGENTS.items():
+                with self.subTest(agent=name, opts=kw):
+                    args = argv(name, **kw)
+                    self.assertIn("krun.use_passt=1", annotations(args))
+                    start = args.index(agent.image) + 1
+                    self.assertEqual(args[start:start + len(sandbx.VM_NET)],
+                                     list(sandbx.VM_NET))
+
+    def test_crun_has_no_vm_networking(self):
+        for name in AGENTS:
+            with self.subTest(agent=name):
+                args = argv(name, runtime="crun")
+                self.assertNotIn("krun.use_passt=1", args)
+                self.assertNotIn(sandbx.VM_NET[0], args)
+
+    def test_vm_net_routes_exactly_the_outbound_range(self):
+        script, addr, ports, sep = sandbx.VM_NET
+        self.assertEqual(ports, sandbx.port_span(sandbx.TO_HOST_PORTS))
+        self.assertIn(f"-T,{ports},", " ".join(argv()))
+        self.assertEqual(sep, "--")
+        self.assertEqual(addr, sandbx.VM_HOST_LOOPBACK)
+        self.assertFalse(addr.startswith("127."))
+
+    def test_passt_wrapper_maps_the_same_address(self):
+        text = (sandbx.IMAGES_DIR / "passt-wrapper").read_text()
+        self.assertIn(
+            f'exec /usr/bin/passt.distrib "$@" --map-host-loopback '
+            f'{sandbx.VM_HOST_LOOPBACK}\n', text)
+
+    def test_base_image_installs_the_pieces(self):
+        text = (sandbx.IMAGES_DIR / "Containerfile.base").read_text()
+        for needle in ("    passt \\\n", "    nftables \\\n",
+                       "dpkg-divert --local --rename --add /usr/bin/passt",
+                       "passt-wrapper /usr/bin/passt\n",
+                       "sandbx-vm-net /usr/local/sbin/sandbx-vm-net\n"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
+        # The wrapper must land after the package it diverts.
+        self.assertLess(text.index("    passt \\\n"), text.index("dpkg-divert"))
+
+    def run_script(self, *args):
+        return subprocess.run(["sh", str(self.VM_NET_SCRIPT), *args],
+                              capture_output=True, text=True, timeout=10)
+
+    def test_vm_net_refuses_bad_usage(self):
+        for args in ([], ["169.254.30.1", "30000-30009", "true"],
+                     ["169.254.30.1", "30000-30009", "--"]):
+            with self.subTest(args=args):
+                r = self.run_script(*args)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("usage:", r.stderr)
+
+    @unittest.skipIf(sandbx.os.geteuid() == 0,
+                     "as root it would change this machine's sysctl and nftables")
+    def test_vm_net_still_starts_the_command_when_routing_fails(self):
+        """Unprivileged, the sysctl write fails; the agent must start anyway."""
+        r = self.run_script("169.254.30.1", "30000-30009", "--",
+                            "sh", "-c", "echo started; exit 3")
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual(r.stdout, "started\n")
+        self.assertIn("will not reach the host", r.stderr)
 
 
 class TestGuards(unittest.TestCase):

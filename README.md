@@ -16,6 +16,8 @@ Several sandboxes run at once.
 ## Requirements
 
 - podman with `krun`: `sudo dnf install crun-krun` on Fedora
+- crun with `krun.use_passt` support (2026-04 or later) and a libkrun whose
+  `krun_add_net_unixstream` can run DHCP in the guest
 - `/dev/kvm` readable and writable by you
 
 `--runtime crun` needs neither, only podman.
@@ -89,7 +91,7 @@ state over, credentials included, and says so. Run `sandbx reset <agent> -p
 | Agents can't read each other's credentials | Only the running agent's state dir is mounted |
 | Sandbox is disposable, data survives | `--rm` container, bind mounts persist |
 | Kernel exploit stays in guest | libkrun microVM with its own kernel (not with `--runtime crun`) |
-| Host network only through reserved ports | pasta forwards specific ranges, nothing else |
+| Host network only through reserved ports | pasta forwards specific ranges, nothing else; a VM's virtio-net passt reaches the host only through them |
 
 The agent still reaches the internet and your LAN. Review what it leaves in the
 project (git hooks, `.envrc`, task files) before running on the host.
@@ -105,6 +107,24 @@ Inside the VM, `127.0.0.1:30000`–`30009` reach the host's localhost. Each
 sandbox claims the first free 10-port block from 30010–30099 and prints it;
 `$SANDBX_HOST_PORTS` has the range. A server on those ports appears on the
 host's `127.0.0.1` at the same numbers.
+
+### How a VM gets there
+
+A krun VM has a virtio-net NIC served by passt (`krun.use_passt`), not
+libkrun's default TSI, which proxies every guest socket through the VMM. TSI
+holds a socket's lock through a blocking `recv()`, so a program that reads on
+one thread and writes on another hangs: `adb shell` froze on the first key.
+
+crun starts `/usr/bin/passt` from the image, so the base image installs it,
+wrapped to add `--map-host-loopback 169.254.30.1`: that address in the guest is
+the container's loopback, where pasta's 30000–30009 forwards listen. At boot,
+`sandbx-vm-net` DNATs the guest's `127.0.0.1:30000`–`30009` to it, then drops
+to `agent`. So inside a VM those ports behave as in a crun container, and the
+host adb server needs nothing beyond running on 30000:
+
+```sh
+adb kill-server; ANDROID_ADB_SERVER_PORT=30000 adb start-server
+```
 
 ## Updating
 

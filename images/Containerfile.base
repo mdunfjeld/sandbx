@@ -30,7 +30,18 @@ RUN apt-get update && apt-get install -y \
     golang \
     zipalign \
     apksigner \
+    passt \
+    nftables \
     && rm -rf /var/lib/apt/lists/*
+
+# ---- krun networking ----
+# krun.use_passt gives the VM a virtio-net NIC served by passt, instead of
+# libkrun's TSI socket proxying. crun runs /usr/bin/passt from inside this
+# image, so it lives here, wrapped to add --map-host-loopback. sandbx-vm-net
+# then routes the guest's 127.0.0.1:30000-30009 through that address.
+RUN dpkg-divert --local --rename --add /usr/bin/passt
+COPY --chmod=755 passt-wrapper /usr/bin/passt
+COPY --chmod=755 sandbx-vm-net /usr/local/sbin/sandbx-vm-net
 
 # ---- Node 22 ----
 # The Codex and Copilot CLIs require Node >= 22; noble ships 18.
