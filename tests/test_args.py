@@ -326,8 +326,30 @@ class TestFlags(unittest.TestCase):
 
     def test_adb_and_host_port_env(self):
         args = argv(host_block=30020)
-        self.assertIn("ANDROID_ADB_SERVER_PORT=30000", args)
+        self.assertIn("ADB_SERVER_SOCKET=localfilesystem:/tmp/sandbx-adb.sock", args)
         self.assertIn("SANDBX_HOST_PORTS=30020-30029", args)
+
+    def test_adb_goes_through_the_relay(self):
+        """adb dialling TCP itself hangs adb shell under krun (TSI), so the
+        relay must sit right before the command under every option, and adb
+        must be pointed at it rather than at the port."""
+        lo, hi = sandbx.TO_HOST_PORTS
+        relay, sock, target, sep = sandbx.ADB_RELAY
+        self.assertEqual(sep, "--")
+        self.assertEqual(target, f"127.0.0.1:{sandbx.ADB_SERVER_PORT}")
+        self.assertTrue(lo <= sandbx.ADB_SERVER_PORT <= hi)
+        for kw in OPTION_SETS:
+            for name, agent in AGENTS.items():
+                with self.subTest(agent=name, opts=kw):
+                    args = argv(name, **kw)
+                    self.assertIn(f"ADB_SERVER_SOCKET=localfilesystem:{sock}", args)
+                    self.assertFalse(
+                        any(a.startswith("ANDROID_ADB_SERVER_PORT=") for a in args))
+                    command = (sandbx.SHELL_COMMAND if kw.get("shell")
+                               else agent.command)
+                    i = args.index(relay)
+                    self.assertEqual(args[i:i + 4], list(sandbx.ADB_RELAY))
+                    self.assertEqual(args[i + 4:i + 4 + len(command)], list(command))
 
     def test_userns_pins_uid(self):
         self.assertIn("--userns=keep-id:uid=1000,gid=1000", argv())
@@ -387,13 +409,15 @@ class TestFlags(unittest.TestCase):
 
 
 class CliRunner:
-    def run_cli(self, name, args, *, real=False, kvm=True, profiles=None):
+    def run_cli(self, name, args, *, real=False, kvm=True, profiles=None,
+                base_version=sandbx.BASE_VERSION):
         """cmd_run against a temp project and state root; returns (rc, out, err).
 
         real=True goes past --dry-run with podman and execvp faked out. The
         host-facing probes are faked either way: the port block is always the
-        first, and kvm decides whether /dev/kvm looks usable. profiles, if
-        given, is the "agents" mapping written to profiles.json first.
+        first, kvm decides whether /dev/kvm looks usable, and base_version is
+        what the agent image's label reads (None: image not built). profiles,
+        if given, is the "agents" mapping written to profiles.json first.
         """
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "proj"
@@ -411,6 +435,8 @@ class CliRunner:
                     sandbx, "pick_host_block", return_value=sandbx.HOST_BLOCKS[0]))
                 stack.enter_context(unittest.mock.patch.object(
                     sandbx, "have_kvm", return_value=kvm))
+                stack.enter_context(unittest.mock.patch.object(
+                    sandbx, "image_base_version", return_value=base_version))
                 self.execvp = None
                 if real:
                     stack.enter_context(unittest.mock.patch.object(
@@ -429,7 +455,8 @@ class TestShellMode(CliRunner, unittest.TestCase):
             with self.subTest(agent=name):
                 args = argv(name, shell=True)
                 tail = args[args.index(agent.image) + 1:]
-                self.assertEqual(tail, [*sandbx.AS_AGENT, *sandbx.SHELL_COMMAND])
+                self.assertEqual(
+                    tail, [*sandbx.AS_AGENT, *sandbx.ADB_RELAY, *sandbx.SHELL_COMMAND])
 
     def test_sandbox_is_identical_up_to_the_image(self):
         for name, agent in AGENTS.items():
@@ -461,7 +488,8 @@ class TestShellMode(CliRunner, unittest.TestCase):
             with self.subTest(flag=flag):
                 rc, out, err = self.run_cli("claude", [flag, "--dry-run"])
                 self.assertEqual(rc, 0)
-                tail = shlex.join(["sandbx-claude", *sandbx.AS_AGENT, "/bin/bash", "-l"])
+                tail = shlex.join(["sandbx-claude", *sandbx.AS_AGENT,
+                                   *sandbx.ADB_RELAY, "/bin/bash", "-l"])
                 self.assertTrue(out.strip().endswith(tail), out)
                 self.assertEqual(err, "")
 
@@ -590,6 +618,45 @@ class TestKvmCheck(CliRunner, unittest.TestCase):
         self.assertIn("/dev/kvm", str(ctx.exception))
         self.execvp.assert_not_called()
 
+    def test_image_from_an_older_base_is_refused_and_nothing_runs(self):
+        """Without the relay in the image, setpriv fails inside the VM."""
+        for built in ("", "0"):
+            with self.subTest(label=built):
+                with self.assertRaises(SandboxError) as ctx:
+                    self.run_cli("claude", [], real=True, base_version=built)
+                self.assertIn("sandbx build --base", str(ctx.exception))
+                self.execvp.assert_not_called()
+
+    def test_missing_image_is_refused_and_nothing_runs(self):
+        with self.assertRaises(SandboxError) as ctx:
+            self.run_cli("codex", [], real=True, base_version=None)
+        self.assertIn("sandbx build codex", str(ctx.exception))
+        self.execvp.assert_not_called()
+
+    def test_dry_run_skips_the_image_check(self):
+        rc, _, _ = self.run_cli("claude", ["--dry-run"], base_version=None)
+        self.assertEqual(rc, 0)
+
+    def test_base_containerfile_carries_the_version_label(self):
+        text = (sandbx.IMAGES_DIR / "Containerfile.base").read_text()
+        self.assertIn(
+            f'LABEL {sandbx.BASE_VERSION_LABEL}="{sandbx.BASE_VERSION}"', text)
+        self.assertIn("sandbx-adb-relay /usr/local/bin/sandbx-adb-relay", text)
+
+    def test_image_base_version_reads_the_label(self):
+        def fake(stdout, rc=0):
+            return unittest.mock.patch.object(
+                sandbx.subprocess, "run",
+                return_value=unittest.mock.Mock(returncode=rc, stdout=stdout))
+        for stdout, want in (("1\n", "1"), ("\n", ""), ("<no value>\n", "")):
+            with self.subTest(stdout=stdout), fake(stdout) as run:
+                self.assertEqual(sandbx.image_base_version("sandbx-claude"), want)
+                cmd = run.call_args.args[0]
+                self.assertEqual(cmd[:3], ["podman", "image", "inspect"])
+                self.assertIn('{{index .Labels "sandbx.base-version"}}', cmd)
+        with fake("", rc=125):
+            self.assertIsNone(sandbx.image_base_version("sandbx-claude"))
+
     def test_dry_run_works_without_kvm(self):
         rc, out, _ = self.run_cli("claude", ["--dry-run"], kvm=False)
         self.assertEqual(rc, 0)
@@ -715,7 +782,7 @@ class TestRuntime(CliRunner, unittest.TestCase):
                     args = argv(name, runtime="crun", shell=shell)
                     self.assertEqual(args[args.index("--user") + 1], "1000:1000")
                     tail = args[args.index(agent.image) + 1:]
-                    self.assertEqual(tail, list(command))
+                    self.assertEqual(tail, [*sandbx.ADB_RELAY, *command])
 
     def test_same_sandbox_under_either_runtime(self):
         for kw in [{}, {"shell": True}, {"relabel": False, "interactive": False}]:
@@ -740,7 +807,8 @@ class TestRuntime(CliRunner, unittest.TestCase):
         args = shlex.split(out)
         self.assertIn("--runtime=crun", args)
         self.assertEqual(annotations(args), [])
-        self.assertEqual(args[-2:], ["sandbx-claude", "claude"])
+        tail = args[args.index("sandbx-claude") + 1:]
+        self.assertEqual(tail, [*sandbx.ADB_RELAY, "claude"])
 
     def test_cli_refuses_vm_options_under_crun(self):
         for flags in (["--ram", "8G"], ["--cpus", "2"], ["--ram", "4G", "--cpus", "1"]):
@@ -1803,6 +1871,9 @@ class TestExecvpError(unittest.TestCase):
                      return_value=sandbx.HOST_BLOCKS[0]), \
                  unittest.mock.patch.object(
                      sandbx, "have_kvm", return_value=True), \
+                 unittest.mock.patch.object(
+                     sandbx, "image_base_version",
+                     return_value=sandbx.BASE_VERSION), \
                  unittest.mock.patch.object(
                      sandbx.shutil, "which", return_value="/usr/bin/podman"), \
                  unittest.mock.patch.object(

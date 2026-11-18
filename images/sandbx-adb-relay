@@ -1,0 +1,115 @@
+#!/usr/bin/python3 -I
+"""Relay adb's client to the host adb server over a Unix socket.
+
+usage: sandbx-adb-relay SOCKET HOST:PORT -- COMMAND [ARG...]
+
+Listens on SOCKET, leaves a relay to HOST:PORT running in the background, then
+execs COMMAND. adb inside the sandbox finds it through ADB_SERVER_SOCKET. The
+relay exits once COMMAND has.
+
+Why: in a krun VM every TCP socket is libkrun's TSI, which holds the socket
+lock for the whole of a blocking recv(). adb shell blocks in recv() on one
+thread and sends keystrokes from another, so the first key waits for a recv()
+that is waiting for that key, and the raw-mode terminal swallows Ctrl+C. AF_UNIX
+sockets are not TSI, and the relay never blocks in recv(): it waits in select()
+first, one process per connection. crun runs the same relay, so adb behaves the
+same under both runtimes.
+"""
+import os
+import select
+import signal
+import socket
+import sys
+
+USAGE = "usage: sandbx-adb-relay SOCKET HOST:PORT -- COMMAND [ARG...]"
+CHUNK = 64 * 1024
+# How often the idle relay checks that COMMAND is still running.
+PARENT_POLL_S = 1.0
+
+
+def pump(a, b):
+    """Copy both ways until each side has closed its write end."""
+    peer = {a: b, b: a}
+    while peer:
+        for s in select.select(list(peer), [], [])[0]:
+            data = s.recv(CHUNK)
+            if data:
+                peer[s].sendall(data)
+                continue
+            try:
+                peer[s].shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            del peer[s]
+
+
+def serve(lsock, target, parent):
+    """Accept until `parent` (COMMAND) is gone; fork a pump per connection."""
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # reap children automatically
+    while os.getppid() == parent:
+        if not select.select([lsock], [], [], PARENT_POLL_S)[0]:
+            continue
+        client, _ = lsock.accept()
+        if os.fork():
+            client.close()
+            continue
+        lsock.close()
+        try:
+            pump(client, socket.create_connection(target))
+        except OSError:
+            pass  # host server not running or connection reset; adb reports it
+        os._exit(0)
+
+
+def listen(path):
+    if os.path.exists(path):
+        os.unlink(path)
+    lsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    lsock.bind(path)
+    lsock.listen(64)
+    return lsock
+
+
+def detach():
+    """Off the terminal, so Ctrl+C and hangups meant for COMMAND miss us."""
+    os.setsid()
+    os.chdir("/")
+    null = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(null, fd)
+
+
+def main(argv):
+    if len(argv) < 4 or argv[2] != "--":
+        sys.exit(USAGE)
+    path, target, command = argv[0], argv[1], argv[3:]
+    host, _, port = target.rpartition(":")
+    if not host or not port.isdigit():
+        sys.exit(USAGE)
+
+    try:
+        lsock = listen(path)
+    except OSError as e:
+        # adb is not worth keeping the agent from starting.
+        print(f"sandbx-adb-relay: {path}: {e}; adb will not reach the host",
+              file=sys.stderr)
+    else:
+        parent = os.getpid()  # exec keeps the pid, so this is COMMAND's
+        if os.fork() == 0:
+            detach()
+            serve(lsock, (host, int(port)), parent)
+            os._exit(0)
+        lsock.close()
+
+    # Python ignores these at startup and exec would pass that on: a shell
+    # whose `yes | head` gets EPIPE instead of dying quietly.
+    for sig in (signal.SIGPIPE, signal.SIGXFSZ):
+        signal.signal(sig, signal.SIG_DFL)
+    try:
+        os.execvp(command[0], command)
+    except OSError as e:
+        sys.exit(f"sandbx-adb-relay: {command[0]}: {e.strerror}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

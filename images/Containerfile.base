@@ -56,6 +56,10 @@ RUN pipx install frida-tools
 RUN pipx install impacket
 
 COPY --chown=agent:agent bashrc /home/agent/.bashrc
+# Every sandbox starts through this; see ADB_RELAY in sandbx.py.
+COPY --chmod=755 sandbx-adb-relay /usr/local/bin/sandbx-adb-relay
+# Must equal BASE_VERSION in sandbx.py, which refuses images without it.
+LABEL sandbx.base-version="1"
 
 # No ENTRYPOINT on purpose: the launcher passes -w and the agent command
 # explicitly, which replaces the old "find the first non-.claude directory" hack.

@@ -30,6 +30,12 @@ CONTAINER_USER = "agent"
 CONTAINER_UID = 1000
 CONTAINER_HOME = "/home/agent"
 BASE_IMAGE = "sandbx-base"
+# Containerfile.base labels its images with this, and agent images inherit it.
+# Bump both whenever the launcher starts relying on something new in the base
+# (1: sandbx-adb-relay), so an image built before fails with "rebuild" rather
+# than a setpriv error from inside the VM.
+BASE_VERSION = "1"
+BASE_VERSION_LABEL = "sandbx.base-version"
 # Where every agent's project lands inside the container. Rendered by
 # workdir_for(); see there for the placeholders and why both are needed.
 WORKDIR_TEMPLATE = "/workspace/{name}"
@@ -72,6 +78,15 @@ VM_MAX_CPUS = 16
 TO_HOST_PORTS = (30000, 30009)
 # adb defaults to 5037, outside the range. The host server must use this too.
 ADB_SERVER_PORT = 30000
+# adb in the sandbox does not dial that port itself: krun's TSI sockets hold
+# their lock through a blocking recv(), so adb shell, which reads on one thread
+# and writes keys on another, hangs on the first key. It talks AF_UNIX to this
+# relay instead (images/sandbx-adb-relay), which forwards to ADB_SERVER_PORT.
+# Placed between AS_AGENT and the command; crun gets it too, so adb works the
+# same in both.
+ADB_RELAY_SOCKET = "/tmp/sandbx-adb.sock"
+ADB_RELAY = ("sandbx-adb-relay", ADB_RELAY_SOCKET,
+             f"127.0.0.1:{ADB_SERVER_PORT}", "--")
 # Inbound (-t): each sandbox takes the first free block of HOST_BLOCKS, and a
 # server the agent starts on one of its ports appears on the same port of the
 # host's 127.0.0.1. Those are host ports, so a fixed range would let only one
@@ -691,13 +706,14 @@ def build_podman_args(
         "-e", f"SANDBX_RUNTIME={runtime}",
         # The ports to serve on for the host to see them, so the agent can say so.
         "-e", f"SANDBX_HOST_PORTS={inbound}",
-        "-e", f"ANDROID_ADB_SERVER_PORT={ADB_SERVER_PORT}",
+        "-e", f"ADB_SERVER_SOCKET=localfilesystem:{ADB_RELAY_SOCKET}",
     ]
     for key, value in agent.env.items():
         args += ["-e", f"{key}={value}"]
     args.append(agent.image)
     if vm:
         args += list(AS_AGENT)
+    args += list(ADB_RELAY)
     if shell:
         args += list(SHELL_COMMAND)
     else:
@@ -879,6 +895,15 @@ def cmd_run(name: str, argv: Sequence[str]) -> int:
             "KVM. Check that virtualization is enabled and /dev/kvm is read-write "
             f"for you, or use --runtime {CONTAINER_RUNTIME} for a plain container"
         )
+    image = AGENTS[name].image
+    built = image_base_version(image)
+    if built is None:
+        raise SandboxError(f"{image} is not built; run `sandbx build {name}`")
+    if built != BASE_VERSION:
+        raise SandboxError(
+            f"{image} was built from an older base image; "
+            f"run `sandbx build --base` to rebuild it and every agent image"
+        )
 
     # Bind mounts get no copy-up, so podman would create this root-owned. Do it
     # after the checks above so a failed launch leaves no stray state behind.
@@ -959,6 +984,19 @@ def image_exists(tag: str) -> bool:
         return False
     probe = subprocess.run(["podman", "image", "exists", tag], capture_output=True)
     return probe.returncode == 0
+
+
+def image_base_version(tag: str) -> str | None:
+    """The BASE_VERSION an image was built with: "" if it predates the label,
+    None if podman does not have the image."""
+    probe = subprocess.run(
+        ["podman", "image", "inspect", "--format",
+         f'{{{{index .Labels "{BASE_VERSION_LABEL}"}}}}', tag],
+        capture_output=True, text=True)
+    if probe.returncode != 0:
+        return None
+    value = probe.stdout.strip()
+    return "" if value == "<no value>" else value
 
 
 def cmd_list(argv: Sequence[str]) -> int:

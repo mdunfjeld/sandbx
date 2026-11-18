@@ -106,6 +106,21 @@ sandbox claims the first free 10-port block from 30010–30099 and prints it;
 `$SANDBX_HOST_PORTS` has the range. A server on those ports appears on the
 host's `127.0.0.1` at the same numbers.
 
+### adb
+
+Run the adb server on the host, on port 30000:
+
+```sh
+adb kill-server; ANDROID_ADB_SERVER_PORT=30000 adb start-server
+```
+
+Inside the sandbox `adb` works with no setup. It does not dial port 30000
+itself: it talks to `sandbx-adb-relay` over a Unix socket (`ADB_SERVER_SOCKET`),
+and the relay forwards to the host. Under krun, every TCP socket in the VM is
+libkrun's TSI, which holds a socket's lock through a blocking `recv()`. `adb
+shell` reads on one thread and sends keystrokes from another, so connected
+directly it hangs on the first key. crun uses the same relay.
+
 ## Updating
 
 Agent images always skip the build cache, so a plain rebuild pulls the latest
