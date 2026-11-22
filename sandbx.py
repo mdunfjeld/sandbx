@@ -66,23 +66,23 @@ VM_MAX_CPUS = 16
 # Networking is pasta with a fixed set of forwards, instead of --network=host,
 # which handed over every localhost service and abstract unix socket.
 #
-# Outbound (-T): 127.0.0.1:30000-30009 inside reaches the same ports on the
-# host. pasta listens inside each sandbox's own namespace, so any number of
-# sandboxes share this range -- and the host's adb server and Burp with it.
+# Outbound (-T), crun only: 127.0.0.1:30000-30009 inside reaches the same
+# ports on the host. pasta listens inside each sandbox's own namespace, so any
+# number of sandboxes share this range -- and the host's adb server and Burp
+# with it.
 TO_HOST_PORTS = (30000, 30009)
 # adb defaults to 5037, outside the range. The host server must use this too.
 ADB_SERVER_PORT = 30000
-# A krun VM gets a virtio-net NIC served by passt (krun.use_passt), not
-# libkrun's default TSI, which proxies every guest socket and holds its lock
-# through a blocking recv(): adb shell, reading on one thread and writing keys
-# on another, hung on the first key. With a real NIC the guest's 127.0.0.1 is
-# its own, so the VM starts through VM_NET, which DNATs 127.0.0.1:30000-30009
-# to VM_HOST_LOOPBACK; images/passt-wrapper maps that address to the
-# container's loopback, where pasta's -T forwards to the host listen. The guest
-# then sees the same ports as a crun container. Must match passt-wrapper.
-VM_HOST_LOOPBACK = "169.254.30.1"
-VM_NET = ("sandbx-vm-net", VM_HOST_LOOPBACK,
-          f"{TO_HOST_PORTS[0]}-{TO_HOST_PORTS[1]}", "--")
+# A krun VM has no outbound range. It gets a virtio-net NIC served by passt
+# (krun.use_passt) instead of libkrun's default TSI, which proxies every guest
+# socket and holds its lock through a blocking recv(): adb shell, reading on
+# one thread and writing keys on another, hung on the first key. crun starts
+# that passt in the container's namespace as `passt -t all -u all --no-map-gw`,
+# fixed: -t all takes every free port there, so pasta's -T listeners fail with
+# "Address already in use", and --no-map-gw leaves the guest no way to reach
+# them anyway. Inbound still works -- pasta's -t lands on the container's
+# loopback, where passt's listener hands it to the guest -- but it arrives at
+# the guest's eth0 address, so a server in the VM must listen on 0.0.0.0.
 # Inbound (-t): each sandbox takes the first free block of HOST_BLOCKS, and a
 # server the agent starts on one of its ports appears on the same port of the
 # host's 127.0.0.1. Those are host ports, so a fixed range would let only one
@@ -596,9 +596,11 @@ def build_podman_args(
     host_block is this sandbox's share of the inbound host ports; cmd_run picks
     it with pick_host_block(), since that part needs to look at the host.
 
-    runtime is one of RUNTIMES. Mounts, network and env are the same under
-    each; what differs is the runtime flag, the VM annotations, SANDBX_RUNTIME,
-    and how the workload becomes `agent` (see the --user comment).
+    runtime is one of RUNTIMES. Mounts, inbound ports and env are the same
+    under each; what differs is the runtime flag, the VM annotations,
+    SANDBX_RUNTIME, how the workload becomes `agent` (see the --user comment),
+    and the outbound range with its ANDROID_ADB_SERVER_PORT, which only crun
+    gets (see TO_HOST_PORTS).
 
     ram_mib and cpus size the VM, so they are refused unless runtime is krun.
     ram_mib=None means VM_RAM_MIB; cpus=None leaves the count to crun.
@@ -670,6 +672,14 @@ def build_podman_args(
     vm = runtime == VM_RUNTIME
     user = "0:0" if vm else f"{CONTAINER_UID}:{CONTAINER_UID}"
 
+    # Podman splits pasta options on commas, so no single spec may hold one --
+    # ranges only, never lists or `auto` combined with a range. No ":to" part,
+    # so each host port lands on the same port inside.
+    pasta = f"-t,127.0.0.1/{inbound}"
+    if not vm:
+        # A VM's passt already holds these ports; see TO_HOST_PORTS.
+        pasta = f"-T,{port_span(TO_HOST_PORTS)},{pasta}"
+
     args = ["podman", "run", "--rm", f"--runtime={runtime}"]
     if interactive:
         args.append("-it")
@@ -678,17 +688,14 @@ def build_podman_args(
         # happens to be, which only lines up with `agent` when that uid is 1000.
         f"--userns=keep-id:uid={CONTAINER_UID},gid={CONTAINER_UID}",
         "--user", user,
-        # Podman splits pasta options on commas, so no single spec may hold
-        # one -- ranges only, never lists or `auto` combined with a range.
-        f"--network=pasta:-T,{port_span(TO_HOST_PORTS)},"
-        # No ":to" part, so each host port lands on the same port inside.
-        f"-t,127.0.0.1/{inbound}",
+        f"--network=pasta:{pasta}",
     ]
     if vm:
         args += ["--annotation", f"krun.ram_mib={ram_mib}"]
         if cpus is not None:
             args += ["--annotation", f"krun.cpus={cpus}"]
-        args += ["--annotation", "krun.use_passt=1"]  # see VM_NET
+        # virtio-net through passt rather than TSI; see TO_HOST_PORTS.
+        args += ["--annotation", "krun.use_passt=1"]
     if not relabel:
         args += ["--security-opt", "label=disable"]
     args += [
@@ -703,14 +710,14 @@ def build_podman_args(
         "-e", f"SANDBX_RUNTIME={runtime}",
         # The ports to serve on for the host to see them, so the agent can say so.
         "-e", f"SANDBX_HOST_PORTS={inbound}",
-        "-e", f"ANDROID_ADB_SERVER_PORT={ADB_SERVER_PORT}",
     ]
+    if not vm:
+        # Only crun can reach the host's adb server; see TO_HOST_PORTS.
+        args += ["-e", f"ANDROID_ADB_SERVER_PORT={ADB_SERVER_PORT}"]
     for key, value in agent.env.items():
         args += ["-e", f"{key}={value}"]
     args.append(agent.image)
     if vm:
-        # VM_NET needs root for nft; AS_AGENT drops to agent right after.
-        args += list(VM_NET)
         args += list(AS_AGENT)
     if shell:
         args += list(SHELL_COMMAND)

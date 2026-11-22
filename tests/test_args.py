@@ -14,7 +14,6 @@ import re
 import shlex
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -69,6 +68,13 @@ def parse_mount(mount_str):
     body = parts[0] if options else mount_str
     src, dst = body.split(":", 1)
     return src, dst, options
+
+
+def pasta_opts(args):
+    """The options podman hands pasta: the --network value after `pasta:`,
+    split on commas the way podman splits it."""
+    (net,) = [t for t in args if t.startswith("--network=")]
+    return net.removeprefix("--network=pasta:").split(",")
 
 
 def skeleton(name, **kw):
@@ -276,13 +282,17 @@ class TestFlags(unittest.TestCase):
         self.assertIn("--runtime=krun", args)
 
     def test_pasta_forwards_only_the_reserved_ranges(self):
+        """A VM gets only its inbound block; crun also gets the outbound range."""
+        self.assertIn("--network=pasta:-t,127.0.0.1/30010-30019", argv())
+        self.assertIn("--network=pasta:-t,127.0.0.1/30040-30049",
+                      argv(host_block=30040))
         self.assertIn(
             "--network=pasta:-T,30000-30009,-t,127.0.0.1/30010-30019",
-            argv(),
+            argv(runtime="crun"),
         )
         self.assertIn(
             "--network=pasta:-T,30000-30009,-t,127.0.0.1/30040-30049",
-            argv(host_block=30040),
+            argv(runtime="crun", host_block=30040),
         )
 
     def test_never_host_network(self):
@@ -315,8 +325,10 @@ class TestFlags(unittest.TestCase):
                         self.assertEqual(args[args.index("--user") + 1], "1000:1000")
                         self.assertNotIn("setpriv", args)
                     else:
-                        prefix = [*sandbx.VM_NET, *sandbx.AS_AGENT]
-                        self.assertEqual(args[start:start + len(prefix)], prefix)
+                        self.assertEqual(
+                            args[start:start + len(sandbx.AS_AGENT)],
+                            list(sandbx.AS_AGENT),
+                        )
 
     def test_vm_memory_is_set(self):
         """libkrun's 1 GiB default is too small; unset, builds run out of RAM."""
@@ -324,9 +336,15 @@ class TestFlags(unittest.TestCase):
         self.assertEqual(args[args.index("--annotation") + 1], "krun.ram_mib=4096")
 
     def test_adb_and_host_port_env(self):
-        args = argv(host_block=30020)
-        self.assertIn("ANDROID_ADB_SERVER_PORT=30000", args)
-        self.assertIn("SANDBX_HOST_PORTS=30020-30029", args)
+        """Only crun reaches the host's adb server, through the outbound range;
+        a VM has no route there, so it gets no ANDROID_ADB_SERVER_PORT."""
+        crun = argv(host_block=30020, runtime="crun")
+        vm = argv(host_block=30020)
+        self.assertIn("ANDROID_ADB_SERVER_PORT=30000", crun)
+        self.assertEqual(
+            [t for t in vm if t.startswith("ANDROID_ADB_SERVER_PORT=")], [])
+        for args in (crun, vm):
+            self.assertIn("SANDBX_HOST_PORTS=30020-30029", args)
 
     def test_userns_pins_uid(self):
         self.assertIn("--userns=keep-id:uid=1000,gid=1000", argv())
@@ -428,8 +446,7 @@ class TestShellMode(CliRunner, unittest.TestCase):
             with self.subTest(agent=name):
                 args = argv(name, shell=True)
                 tail = args[args.index(agent.image) + 1:]
-                self.assertEqual(
-                    tail, [*sandbx.VM_NET, *sandbx.AS_AGENT, *sandbx.SHELL_COMMAND])
+                self.assertEqual(tail, [*sandbx.AS_AGENT, *sandbx.SHELL_COMMAND])
 
     def test_sandbox_is_identical_up_to_the_image(self):
         for name, agent in AGENTS.items():
@@ -461,8 +478,7 @@ class TestShellMode(CliRunner, unittest.TestCase):
             with self.subTest(flag=flag):
                 rc, out, err = self.run_cli("claude", [flag, "--dry-run"])
                 self.assertEqual(rc, 0)
-                tail = shlex.join(["sandbx-claude", *sandbx.VM_NET, *sandbx.AS_AGENT,
-                                   "/bin/bash", "-l"])
+                tail = shlex.join(["sandbx-claude", *sandbx.AS_AGENT, "/bin/bash", "-l"])
                 self.assertTrue(out.strip().endswith(tail), out)
                 self.assertEqual(err, "")
 
@@ -672,21 +688,26 @@ class TestVmSize(CliRunner, unittest.TestCase):
 
 def without_runtime(args):
     """The argv minus everything that is allowed to differ between runtimes:
-    the runtime itself, the VM annotations, and the VM's start-up prefix
-    (VM_NET's port routing, then AS_AGENT)."""
-    prefix = [*sandbx.VM_NET, *sandbx.AS_AGENT]
-    args, n = list(args), len(prefix)
+    the runtime itself, the VM annotations, how the workload becomes agent,
+    and crun's outbound range with its ANDROID_ADB_SERVER_PORT."""
+    args, n = list(args), len(sandbx.AS_AGENT)
     for i in range(len(args) - n + 1):
-        if args[i:i + n] == prefix:
+        if args[i:i + n] == list(sandbx.AS_AGENT):
             del args[i:i + n]
             break
+    outbound = f"-T,{sandbx.port_span(sandbx.TO_HOST_PORTS)},"
     out, i = [], 0
     while i < len(args):
         if args[i] in ("--annotation", "--user"):
             i += 2
             continue
+        if args[i] == "-e" and args[i + 1].startswith("ANDROID_ADB_SERVER_PORT="):
+            i += 2
+            continue
         if args[i].startswith("--runtime=") or args[i].startswith("SANDBX_RUNTIME="):
             out.append("<runtime>")
+        elif args[i].startswith("--network="):
+            out.append(args[i].replace(outbound, "", 1))
         else:
             out.append(args[i])
         i += 1
@@ -765,8 +786,10 @@ class TestPorts(unittest.TestCase):
     def ports(self, span):
         return set(range(span[0], span[1] + 1))
 
-    def network(self, **kw):
-        return next(t for t in argv(**kw) if t.startswith("--network="))
+    def inbound(self, **kw):
+        """pasta's -t spec: the host -> sandbox forward."""
+        opts = pasta_opts(argv(**kw))
+        return opts[opts.index("-t") + 1]
 
     def test_blocks_are_disjoint_from_outbound_and_each_other(self):
         seen = self.ports(sandbx.TO_HOST_PORTS)
@@ -785,30 +808,35 @@ class TestPorts(unittest.TestCase):
     def test_inbound_ports_are_the_same_inside_and_on_the_host(self):
         """A remap (`host:inside`) made $SANDBX_HOST_PORTS wrong inside the
         sandbox for every block but the first."""
-        for block in sandbx.HOST_BLOCKS:
-            with self.subTest(block=block):
-                args = argv(host_block=block)
-                span = sandbx.port_span(sandbx.block_ports(block))
-                inbound = self.network(host_block=block).split(",-t,", 1)[1]
-                self.assertEqual(inbound, f"127.0.0.1/{span}")
-                self.assertIn(f"SANDBX_HOST_PORTS={span}", args)
+        for runtime in sandbx.RUNTIMES:
+            for block in sandbx.HOST_BLOCKS:
+                with self.subTest(runtime=runtime, block=block):
+                    args = argv(host_block=block, runtime=runtime)
+                    span = sandbx.port_span(sandbx.block_ports(block))
+                    self.assertEqual(self.inbound(host_block=block, runtime=runtime),
+                                     f"127.0.0.1/{span}")
+                    self.assertIn(f"SANDBX_HOST_PORTS={span}", args)
 
     def test_adb_port_is_forwarded_to_the_host(self):
         self.assertIn(sandbx.ADB_SERVER_PORT, self.ports(sandbx.TO_HOST_PORTS))
 
     def test_inbound_listens_on_host_loopback_only(self):
         """Without the address, pasta would expose the agent's servers to the LAN."""
-        for block in sandbx.HOST_BLOCKS:
-            with self.subTest(block=block):
-                inbound = self.network(host_block=block).split(",-t,", 1)[1]
-                self.assertTrue(inbound.startswith("127.0.0.1/"), inbound)
+        for runtime in sandbx.RUNTIMES:
+            for block in sandbx.HOST_BLOCKS:
+                with self.subTest(runtime=runtime, block=block):
+                    inbound = self.inbound(host_block=block, runtime=runtime)
+                    self.assertTrue(inbound.startswith("127.0.0.1/"), inbound)
 
     def test_podman_comma_split_yields_the_intended_options(self):
         """Podman splits pasta options on commas; a comma inside a spec would
         silently turn one forward into several unrelated arguments."""
-        opts = self.network().split(":", 1)[1].split(",")
-        self.assertEqual(opts[0::2], ["-T", "-t"])
-        self.assertEqual(len(opts), 4)
+        for runtime, flags in ((sandbx.VM_RUNTIME, ["-t"]),
+                               (sandbx.CONTAINER_RUNTIME, ["-T", "-t"])):
+            with self.subTest(runtime=runtime):
+                opts = pasta_opts(argv(runtime=runtime))
+                self.assertEqual(opts[0::2], flags)
+                self.assertEqual(len(opts), 2 * len(flags))
 
     def test_picks_the_first_free_block(self):
         self.assertEqual(sandbx.pick_host_block(lambda port: True), 30010)
@@ -835,76 +863,35 @@ class TestPorts(unittest.TestCase):
 
 
 class TestVmNetwork(unittest.TestCase):
-    """A krun VM gets virtio-net (passt) instead of TSI, and its 127.0.0.1 is
-    routed to the host's reserved ports so the guest sees what crun sees."""
+    """A krun VM gets virtio-net (passt) instead of TSI, and with it no
+    sandbox -> host ports; see TO_HOST_PORTS."""
 
-    VM_NET_SCRIPT = sandbx.IMAGES_DIR / "sandbx-vm-net"
-
-    def test_every_vm_uses_passt_and_routes_the_host_ports(self):
+    def test_every_vm_uses_passt(self):
         for kw in OPTION_SETS:
             if kw.get("runtime") == "crun":
                 continue
-            for name, agent in AGENTS.items():
+            for name in AGENTS:
                 with self.subTest(agent=name, opts=kw):
-                    args = argv(name, **kw)
-                    self.assertIn("krun.use_passt=1", annotations(args))
-                    start = args.index(agent.image) + 1
-                    self.assertEqual(args[start:start + len(sandbx.VM_NET)],
-                                     list(sandbx.VM_NET))
+                    self.assertIn("krun.use_passt=1", annotations(argv(name, **kw)))
 
     def test_crun_has_no_vm_networking(self):
         for name in AGENTS:
             with self.subTest(agent=name):
-                args = argv(name, runtime="crun")
-                self.assertNotIn("krun.use_passt=1", args)
-                self.assertNotIn(sandbx.VM_NET[0], args)
+                self.assertNotIn("krun.use_passt=1", argv(name, runtime="crun"))
 
-    def test_vm_net_routes_exactly_the_outbound_range(self):
-        script, addr, ports, sep = sandbx.VM_NET
-        self.assertEqual(ports, sandbx.port_span(sandbx.TO_HOST_PORTS))
-        self.assertIn(f"-T,{ports},", " ".join(argv()))
-        self.assertEqual(sep, "--")
-        self.assertEqual(addr, sandbx.VM_HOST_LOOPBACK)
-        self.assertFalse(addr.startswith("127."))
-
-    def test_passt_wrapper_maps_the_same_address(self):
-        text = (sandbx.IMAGES_DIR / "passt-wrapper").read_text()
-        self.assertIn(
-            f'exec /usr/bin/passt.distrib "$@" --map-host-loopback '
-            f'{sandbx.VM_HOST_LOOPBACK}\n', text)
-
-    def test_base_image_installs_the_pieces(self):
-        text = (sandbx.IMAGES_DIR / "Containerfile.base").read_text()
-        for needle in ("    passt \\\n", "    nftables \\\n",
-                       "dpkg-divert --local --rename --add /usr/bin/passt",
-                       "passt-wrapper /usr/bin/passt\n",
-                       "sandbx-vm-net /usr/local/sbin/sandbx-vm-net\n"):
-            with self.subTest(needle=needle):
-                self.assertIn(needle, text)
-        # The wrapper must land after the package it diverts.
-        self.assertLess(text.index("    passt \\\n"), text.index("dpkg-divert"))
-
-    def run_script(self, *args):
-        return subprocess.run(["sh", str(self.VM_NET_SCRIPT), *args],
-                              capture_output=True, text=True, timeout=10)
-
-    def test_vm_net_refuses_bad_usage(self):
-        for args in ([], ["169.254.30.1", "30000-30009", "true"],
-                     ["169.254.30.1", "30000-30009", "--"]):
-            with self.subTest(args=args):
-                r = self.run_script(*args)
-                self.assertEqual(r.returncode, 2)
-                self.assertIn("usage:", r.stderr)
-
-    @unittest.skipIf(sandbx.os.geteuid() == 0,
-                     "as root it would change this machine's sysctl and nftables")
-    def test_vm_net_still_starts_the_command_when_routing_fails(self):
-        """Unprivileged, the sysctl write fails; the agent must start anyway."""
-        r = self.run_script("169.254.30.1", "30000-30009", "--",
-                            "sh", "-c", "echo started; exit 3")
-        self.assertEqual(r.returncode, 3)
-        self.assertEqual(r.stdout, "started\n")
-        self.assertIn("will not reach the host", r.stderr)
+    def test_vm_never_forwards_to_the_host(self):
+        """crun starts the VM's passt as `passt -t all ...` in the container's
+        namespace, which takes every free port there. A -T listener then cannot
+        bind, and podman fails: "Listen failed for SPLICE TCP port *%lo/30000:
+        Address already in use"."""
+        for kw in OPTION_SETS:
+            if kw.get("runtime") == "crun":
+                continue
+            for name in AGENTS:
+                with self.subTest(agent=name, opts=kw):
+                    opts = pasta_opts(argv(name, **kw))
+                    self.assertNotIn("-T", opts)
+                    self.assertNotIn("--tcp-ns", opts)
 
 
 class TestGuards(unittest.TestCase):
